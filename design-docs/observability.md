@@ -1,74 +1,35 @@
 # Observability
 
-How we observe trip search: logs, metrics, traces, and alerts — keyed on `requestId` end to end.
+How we observe trip search — keyed on `requestId` end to end.
 
 ---
 
-## Signals
+## What's implemented today
 
-| Signal | What runs |
-|--------|--------|
-| Structured logs | **pino** — JSON to stdout, keyed on `requestId` + `route` |
-| Log aggregation | **Loki** via **Promtail** (Docker Compose) |
-| Dashboards | **Grafana** — Trip Search Logs dashboard provisioned |
-| API error events | `validation_error`, `parse_error`, `quorum_failure`, `global_timeout`, `internal_error`, `trip_not_found` |
-| Orchestration events | `search_start`, `search_complete`, `provider_result`, `provider_quorum_retry`, `cache_refresh_failed`, `redis_error` |
-| Health | `GET /api/health` — Redis ping, service name, timestamp, mock flags; 503 when Redis down |
-| Correlation | `X-Request-Id` on SSE responses (generate at ingress if missing) |
-| Duration | `X-Duration-Ms` on SSE responses |
-| Metrics | Prometheus scrape on `/api/metrics` — search SLO, per-provider latency, quorum, breakers, cache |
-| Tracing | OpenTelemetry — `trip.search` span tree; auto-instrumented `fetch` and incoming HTTP |
-| Alerts | Grafana rules — p95 latency, quorum failure rate, breaker stuck open, Redis down |
+| Signal | Tool | How to use it |
+|--------|------|---------------|
+| Structured logs | **pino** (`src/lib/observability/logger.ts`) | JSON to stdout; each request gets `requestId` + `route` |
+| Log aggregation | **Promtail → Loki → Grafana** (Docker Compose) | `docker compose up` → Grafana on `:3001` |
+| Dashboards | **Grafana** — Trip Search Logs | Filter by `requestId`, event type, provider |
+| Health | `GET /api/health` | Redis ping; 503 when Redis down |
+| Correlation | `X-Request-Id` header | Copy from API response → paste into Grafana |
+| Duration | `X-Duration-Ms` header | Total search time on SSE responses |
 
-**Compose stack** (`docker compose up`): app stdout → Promtail (Docker socket) → Loki → Grafana on `:3001`; Prometheus scrapes `/api/metrics`. Config under `observability/`. In K8s, Fluent Bit replaces Promtail and Tempo/X-Ray replaces the local collector — same signal paths.
+**Compose stack:** app stdout → Promtail (Docker socket) → Loki → Grafana. Config lives under `observability/`. Run `docker compose up` to get the full log pipeline locally.
+
+**Not implemented yet:** Prometheus `/api/metrics`, OpenTelemetry tracing, Grafana alert rules. Those are documented below as the production roadmap.
 
 ---
 
-## Stack
+## Production roadmap
 
-```
-App pod → stdout (JSON logs) → Fluent Bit → Loki or CloudWatch
-         → OTEL SDK → Collector → Tempo or X-Ray
-         → Prometheus client → scrape → Grafana
-```
+These are design targets for a production deployment — not running in this repo today.
 
-Traces, metrics, and logs are keyed on `requestId`. W3C `traceparent` propagates at the ingress boundary.
+### Metrics (planned)
 
----
+Prometheus would scrape `/api/metrics` for SLO tracking.
 
-## Tracing
-
-**Span tree:**
-
-```
-trip.search
-├── llm.parse
-├── cache.lookup
-├── provider.fanout
-│   ├── provider.sabre → normalize.sabre
-│   ├── provider.amadeus → normalize.amadeus
-│   └── provider.hotelbeds → normalize.hotelbeds
-├── provider.quorum_retry (optional — failed providers only, attempt 2)
-├── rank + budget
-└── package.response
-```
-
-**Span attributes**
-
-| Span | Tags |
-|------|------|
-| `trip.search` | `requestId`, `route`, `cache.status`, `quorum.met`, `durationMs` |
-| `llm.parse` | `model`, `mock`, `parse.source` (openai / regex / modify) |
-| `provider.*` | `provider.name`, `status`, `offerCount`, `durationMs`, `attempt` (1 or 2), `circuitBreaker.state` |
-| `provider.quorum_retry` | `providersSucceeded`, `providersRequired`, `retryingProviders`, `retryTimeoutMs` |
-
-Runs on `@opentelemetry/sdk-node` with auto-instrumentation for `fetch` and incoming HTTP.
-
----
-
-## Metrics
-
-**Histograms (SLO tracking)**
+**Histograms**
 
 | Name | Labels | Use |
 |------|--------|-----|
@@ -92,13 +53,44 @@ Runs on `@opentelemetry/sdk-node` with auto-instrumentation for `fetch` and inco
 | `circuit_breaker_state` | `provider` | 0=closed, 1=open, 2=half-open |
 | `http_inflight_requests` | — | HPA custom metric (see [kubernetes.md](./kubernetes.md)) |
 
-Exposed on `/api/metrics`. Grafana dashboards: search SLO panel + per-provider health panel.
+### Tracing (planned)
+
+OpenTelemetry span tree on `@opentelemetry/sdk-node`:
+
+```
+trip.search
+├── llm.parse
+├── cache.lookup
+├── provider.fanout
+│   ├── provider.sabre → normalize.sabre
+│   ├── provider.amadeus → normalize.amadeus
+│   └── provider.hotelbeds → normalize.hotelbeds
+├── provider.quorum_retry (optional)
+├── rank + budget
+└── package.response
+```
+
+W3C `traceparent` would propagate at the ingress boundary. In K8s, Fluent Bit replaces Promtail and Tempo/X-Ray replaces the local collector — same signal paths.
+
+### Alerts (planned)
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| Latency | p95 > 3s for 5 min | Warning |
+| Quorum failures | 503 rate > 5% for 5 min | Critical |
+| Breaker stuck | Any open > 2 min | Warning |
+| Provider timeouts | > 10/min per provider | Warning |
+| Cache hit ratio | < 20% for 15 min | Info |
+| Pod not ready | Readiness failing > 3 min | Critical |
+| Redis down | `redis: "error"` on health > 1 min | Critical |
 
 ---
 
-## Logging
+## Logging reference
 
-pino via `src/lib/observability/logger.ts`. Each API request gets a child logger with `requestId` and `route`. Schema:
+pino via `src/lib/observability/logger.ts`. Each API request gets a child logger with `requestId` and `route`.
+
+**Example — quorum retry**
 
 ```json
 {
@@ -114,6 +106,8 @@ pino via `src/lib/observability/logger.ts`. Each API request gets a child logger
 }
 ```
 
+**Example — quorum failure**
+
 ```json
 {
   "level": "error",
@@ -128,16 +122,23 @@ pino via `src/lib/observability/logger.ts`. Each API request gets a child logger
 }
 ```
 
-**Log**
+### Event names you'll see
 
-- Search start: `requestId`, route, query *length* (not content)
-- Parse done: `llm_parse_complete` (with `cachedPromptTokens`) or `llm_parse_fallback` (`reason`, `mode`)
-- Per provider: name, status, offer count, duration (`attempt: 2` on quorum retry)
-- Quorum retry: `provider_quorum_retry` with `retryingProviders` and `retryTimeoutMs`
-- Quorum failure: which providers failed (after retry, if enabled)
-- Breaker open: provider, consecutive failure count
+| Event | When |
+|-------|------|
+| `search_start` | Search begins — logs query **length**, not content |
+| `llm_parse_complete` | OpenAI parse succeeded |
+| `llm_parse_fallback` | Fell back to regex/modify parser |
+| `provider_result` | One provider finished (`attempt: 2` on quorum retry) |
+| `provider_quorum_retry` | Retrying failed providers |
+| `quorum_failure` | Fewer than 2 providers succeeded |
+| `search_complete` | Search finished |
+| `cache_refresh_failed` | Background stale refresh failed |
+| `redis_error` | Redis operation failed |
 
-**Don't log**
+API-layer events: `validation_error`, `parse_error`, `global_timeout`, `internal_error`, `trip_not_found`.
+
+### What we don't log
 
 - Full natural-language queries (PII)
 - API keys, OAuth tokens, HotelBeds signatures
@@ -146,26 +147,13 @@ pino via `src/lib/observability/logger.ts`. Each API request gets a child logger
 
 ---
 
-## Alerts
+## Debugging a search (step by step)
 
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| Latency | p95 > 3s for 5 min | Warning |
-| Quorum failures | 503 rate > 5% for 5 min | Critical |
-| Breaker stuck | Any open > 2 min | Warning |
-| Provider timeouts | > 10/min per provider | Warning |
-| Cache hit ratio | < 20% for 15 min | Info (tune TTL or traffic pattern) |
-| Pod not ready | Readiness failing > 3 min | Critical |
-| Redis down | `redis: "error"` on health > 1 min | Critical |
+1. Run the app (`docker compose up` or `npm run dev`).
+2. Perform a search in the UI or via curl.
+3. Copy `X-Request-Id` from the response header.
+4. Open Grafana → **Trip Search Logs** dashboard.
+5. Paste the `requestId` into the dashboard variable.
+6. Read events in order: `search_start` → `llm_parse_*` → `provider_result` × 3 → `search_complete` (or `quorum_failure`).
 
----
-
-## How the pieces fit
-
-Structured logging is the foundation. pino (`src/lib/observability/logger.ts`) gives every search a child logger keyed on `requestId` and `route`, with fixed event names across the API and orchestration layers. Promtail ships stdout to Loki; Grafana provides the Trip Search Logs dashboard for filtering by `requestId`, event type, and provider.
-
-Prometheus scrapes `/api/metrics` for SLO tracking — search duration histograms, per-provider latency, quorum failure counters, circuit breaker gauges, and cache hit ratio. The `http_inflight_requests` gauge feeds the HPA custom metric in [kubernetes.md](./kubernetes.md).
-
-OpenTelemetry instruments the span tree in the Tracing section — root `trip.search` with children for `llm.parse`, `cache.lookup`, each `provider.*`, normalize, rank, and response packaging. Auto-instrumentation on `fetch` and incoming HTTP means we can trace a slow search to a specific GDS without grepping logs.
-
-Grafana alert rules cover the conditions in the Alerts table: p95 latency breach, quorum failure rate, breaker stuck open, provider timeout spikes, and Redis unreachable via the health endpoint.
+If Grafana isn't running, logs are still in stdout — pipe through `jq` and filter on `requestId`.

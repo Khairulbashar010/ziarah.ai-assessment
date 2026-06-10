@@ -1,6 +1,8 @@
 # Kubernetes deployment
 
-Production topology for the trip search service. Image: multi-stage Dockerfile → `node server.js` on port 3000.
+Production topology for the trip search service. The YAML below is **reference design** — example manifests for review, not checked into a `k8s/` folder.
+
+Image: multi-stage Dockerfile → `node server.js` on port 3000.
 
 ---
 
@@ -14,52 +16,55 @@ Route 53 → ALB (TLS, idle timeout 30s) → Service :3000 → Deployment (N pod
                                                     Sabre / Amadeus / HotelBeds / OpenAI
 ```
 
-Namespace: `ziarah-search`. ConfigMap for non-secret env; Secrets (or External Secrets Operator) for keys and `REDIS_URL`.
+- **Namespace:** `ziarah-search`
+- **ConfigMap:** non-secret env (timeouts, TTL, model name)
+- **Secrets** (or External Secrets Operator): provider keys and `REDIS_URL`
+
+This deployment is the **trip search module only**. Chat shell, auth, bookings, and payments would live in other services in a full Ziarah platform.
 
 ---
 
-## Scaling
+## Scaling (plain English)
 
-This deployment is the **trip search module** only — chat shell, auth, bookings, and payments run in other services. Peak load here is **in-flight searches** (concurrent `/api/trips/search*` requests), not total app concurrency.
+**What we're sizing for:** 10,000 searches running at the same time (in-flight), not 10,000 total users.
 
-In a conversational trip planner, most concurrent app users are reading results, typing, or comparing offers — not waiting on a search. During peak, roughly **8–15%** of whole-app sessions have an active search in flight.
+Most app users are reading results, typing, or comparing — not actively waiting on a search. During peak, roughly **8–15%** of concurrent app sessions have an open search request.
 
-```text
+```
 concurrent app users ≈ in-flight searches ÷ active-search ratio
 ```
 
-| Peak target (this module) | Implied whole-app concurrent users |
-|---------------------------|-------------------------------------|
-| **10k in-flight searches** | **~67k–125k** (at 8–15% active-search ratio) |
+| Peak in-flight searches | Implied whole-app concurrent users |
+|------------------------|-------------------------------------|
+| **10k** | **~67k–125k** (at 8–15% ratio) |
 
-**Capacity model — 10k in-flight searches**
+### Per-pod capacity
 
-| Input | Value | Notes |
-|-------|-------|-------|
-| Peak in-flight searches | 10k | Module-local; one open search per active session |
-| Active-search ratio (whole app) | 8–15% | Browse/chat time between searches |
-| Avg search duration | ~2s | Blended hit/miss; p95 miss budget is 3s |
-| Capacity per pod | ~100 in-flight | On 512Mi / 1 CPU — measured via `load/capacity.js` |
-| HPA scale signal | ~100 in-flight/pod | Custom `http_inflight_requests` (see HPA manifest) |
-| Peak replicas | ~100 | 10k ÷ 100; provider rate limits may bind before pod count |
+Search is **I/O-bound** (waiting on Sabre/Amadeus/HotelBeds), not CPU-bound. CPU alone is a poor scaling signal.
 
-Search is I/O-bound. CPU alone is a poor HPA signal. Target 60% CPU *and* `http_inflight_requests` (~100/pod).
+| Input | Value | How we got it |
+|-------|-------|---------------|
+| Avg search duration | ~2s | Blended cache hit/miss |
+| Capacity per pod | ~100 in-flight | Measured with `load/capacity.js` on 512Mi / 1 CPU |
+| Peak replicas needed | ~100 | 10k ÷ 100 |
 
-HPA: min 4, max 100. Scale up fast (30s), scale down slow (5 min stabilization) to avoid flapping on traffic spikes.
+**HPA settings:** min 4, max 100 replicas. Scale up fast (30s), scale down slow (5 min) to avoid flapping.
 
-| Replicas | ~In-flight searches (at 100/pod) | ~Whole-app users (at 10% active-search) |
-|----------|-----------------------------------|------------------------------------------|
+| Replicas | ~In-flight searches | ~Whole-app users (at 10% active-search) |
+|----------|---------------------|----------------------------------------|
 | 10 | 1k | ~10k |
 | 25 | 2.5k | ~25k |
 | 50 | 5k | ~50k |
 | 75 | 7.5k | ~75k |
 | 100 | 10k | ~100k |
 
-**Capacity notes:** Per-pod throughput is bounded by memory (offer payload size), outbound connection pools, upstream latency, and provider rate limits — often before Kubernetes runs out of pods. `load/capacity.js` step-ramps VUs on 512Mi / 1 CPU hardware to confirm the ~100 in-flight/pod assumption and tune HPA targets.
+**Caveats:** Per-pod throughput is also bounded by memory (offer payload size), outbound connection pools, upstream latency, and provider rate limits — often before Kubernetes runs out of pods. Run `load/capacity.js` on hardware matching prod to validate the ~100/pod assumption.
+
+The `http_inflight_requests` HPA metric in the example below is a **planned** custom metric — not implemented in the app yet. See [observability.md](./observability.md).
 
 ---
 
-## Deployment
+## Deployment (example)
 
 ```yaml
 apiVersion: apps/v1
@@ -131,11 +136,11 @@ spec:
             periodSeconds: 5
 ```
 
-Pods are stateless. Rolling deploy with `maxUnavailable: 0` so capacity doesn't drop mid-release. Query cache and result store live in Redis (ElastiCache), not pod memory — restarts don't evict cache entries.
+Pods are stateless. `maxUnavailable: 0` keeps capacity during rolling deploys. Cache and results live in Redis, not pod memory.
 
 ---
 
-## Service + HPA
+## Service + HPA (example)
 
 ```yaml
 apiVersion: v1
@@ -186,7 +191,7 @@ spec:
 
 ---
 
-## Ingress (ALB)
+## Ingress (ALB example)
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -215,7 +220,7 @@ spec:
                   number: 80
 ```
 
-TLS terminates at the ALB. Set idle timeout to 30s; SSE streams need the connection kept open but individual events arrive well within that for normal searches.
+TLS terminates at the ALB. Idle timeout 30s — SSE streams keep the connection open; individual events arrive well within that for normal searches.
 
 ---
 
@@ -256,7 +261,7 @@ Use External Secrets Operator or AWS Secrets Manager CSI. Don't commit secrets t
 
 ## Redis
 
-Redis is a **required dependency** — local dev, Docker Compose, and K8s all set `REDIS_URL`. Implementation: `src/lib/storage/redis.ts` + `redis-keys.ts`.
+Redis is a **required dependency** — local dev, Docker Compose, and K8s all set `REDIS_URL`. Code: `src/lib/storage/redis.ts` + `redis-keys.ts`.
 
 | Store | Key pattern | TTL |
 |-------|-------------|-----|
@@ -264,21 +269,21 @@ Redis is a **required dependency** — local dev, Docker Compose, and K8s all se
 | Result store | `trip:result:{requestId}` | 1 hour (`TRIP_RESULT_TTL_SECONDS`) |
 | Refresh lock | `trip:lock:{sha256}` | 30s (`SET NX EX`) |
 
-Stale-while-revalidate uses distributed locks so only one pod refreshes per cache key; concurrent waiters poll for a fresh entry.
+Stale-while-revalidate uses distributed locks so only one pod refreshes per cache key.
 
-`GET /api/health` pings Redis and returns 503 when unreachable — readiness fails so traffic routes to healthy pods only.
+`GET /api/health` pings Redis — 503 when unreachable, so readiness routes traffic away from unhealthy pods.
 
-If Redis goes down, live searches still work; cache hits and cross-pod `GET /api/trips/{id}` are lost. Run Redis Multi-AZ with automatic failover.
+If Redis goes down entirely, live searches still work; cache hits and cross-pod `GET /api/trips/{id}` are lost. Run Redis Multi-AZ with automatic failover in production.
 
 ---
 
-## CI/CD
+## CI/CD (target pipeline)
 
 ```
 push → test + lint → docker build → trivy scan → ECR push → helm upgrade → k6 smoke + /api/health
 ```
 
-Gates: Vitest green (635+ tests, 80% coverage), standalone build succeeds, no critical CVEs in the image, `load/smoke.js` passes, readiness probe passes after deploy.
+Gates: Vitest green (635+ tests, 80% coverage), standalone build succeeds, no critical CVEs, `load/smoke.js` passes, readiness probe passes after deploy.
 
 ---
 
@@ -302,4 +307,4 @@ Gates: Vitest green (635+ tests, 80% coverage), standalone build succeeds, no cr
 | AZ loss | Reduced capacity | Multi-AZ node groups, PDB `minAvailable: 75%` |
 | Redis down | Cache misses only | Live search still works |
 | All GDS down | 503s | Serve stale cache if available; status page |
-| Region loss | Full outage | Single-region deployment; DR is out of scope for v1 |
+| Region loss | Full outage | Single-region deployment; DR out of scope for v1 |

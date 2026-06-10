@@ -1,66 +1,84 @@
 # Failure handling
 
-Latency bounds, circuit breakers, quorum rules, and degradation paths when upstreams are slow, down, or flaky. Code: `src/lib/resilience/`, `src/lib/orchestration/trip-search-service.ts`, `src/lib/providers/run-provider-client.ts`.
+How the service stays within latency bounds when upstreams are slow, down, or flaky.
+
+**Code locations:** `src/lib/resilience/`, `src/lib/orchestration/trip-search-service.ts`, `src/lib/providers/run-provider-client.ts`.
 
 ---
 
 ## Philosophy
 
-Trip search has a hard latency ceiling (~3s p95). We fail fast per provider on the first attempt, aggregate what we got, and only retry when quorum is at risk. Retries are **bounded**: one extra round, failed providers only, shorter timeout — not an open-ended retry loop. Client re-search and stale cache cover longer outages.
+Trip search has a hard latency ceiling (~3s p95 on the sync route). The approach:
+
+1. **Fail fast** per provider on the first attempt (2.5s cap).
+2. **Isolate** failures — one provider dying doesn't cancel the others.
+3. **Retry once** if quorum is at risk — only failed providers, shorter timeout.
+4. **Let the client re-search** for longer outages; stale cache covers repeat queries.
+
+There is no open-ended retry loop.
+
+---
+
+## Quorum (the most important rule)
+
+Every search calls **three providers**: Sabre, Amadeus, HotelBeds.
+
+**Rule:** at least **2 of 3** must return `status: "success"`, or the API throws `QuorumError` → HTTP 503.
+
+This is a simple count. It does **not** require both flights and hotels — only that two providers responded OK.
+
+| Outcome (final) | HTTP | `partialResults` | What the user gets |
+|-----------------|------|------------------|-------------------|
+| 3/3 | 200 | false | Flights + hotels |
+| 2/3 | 200 | true | Whatever the two successful providers returned |
+| 0–1/3 | 503 | n/a | Error message |
+
+**Common scenarios**
+
+| Who succeeded | Result |
+|---------------|--------|
+| Sabre + HotelBeds (Amadeus down) | 200 — flights + hotels, `partialResults: true` |
+| Amadeus + HotelBeds (Sabre down) | 200 — flights + hotels, `partialResults: true` |
+| Sabre + Amadeus (HotelBeds down) | 200 — **flights only**, no hotels, `partialResults: true` |
+| HotelBeds only (both GDSs down) | 503 after retry |
+
+HotelBeds is the only hotel source. If it's down, users still get flights when both GDSs succeed — but no hotel offers. Serving stale hotel cache on HotelBeds outage is listed as a future improvement in the README.
+
+**When retry runs:** only when attempt 1 yields fewer than 2 successes. Providers that already succeeded are **not** called again.
 
 ---
 
 ## Timeouts
 
-| Layer | Default | Env var | Notes |
-|-------|---------|---------|-------|
+| Layer | Default | Env var | Applies to |
+|-------|---------|---------|------------|
 | Per-provider (attempt 1) | 2500ms | `PROVIDER_TIMEOUT_MS` | Initial parallel fan-out |
-| Quorum retry (attempt 2) | 1000ms | `PROVIDER_RETRY_TIMEOUT_MS` | Failed providers only; skipped when quorum already met |
-| Global (sync only) | 3000ms prod | `GLOBAL_TIMEOUT_MS` | Wraps entire `searchTrip()` including one retry round |
-| LLM parse | 12000ms | `LLM_PARSE_TIMEOUT_MS` | `AbortController` on OpenAI |
-| Stream route | none (global) | — | Per-provider caps still apply on both attempts |
+| Quorum retry (attempt 2) | 1000ms | `PROVIDER_RETRY_TIMEOUT_MS` | Failed providers only |
+| Global (sync only) | 3000ms prod | `GLOBAL_TIMEOUT_MS` | Entire `searchTrip()` including retry |
+| LLM parse | 12000ms | `LLM_PARSE_TIMEOUT_MS` | OpenAI call (`AbortController`) |
+| Stream route | no global cap | — | Per-provider caps still apply on both attempts |
 
-Provider I/O eats most of the budget. The 2.5s per-provider cap means the slowest upstream can't block the initial fan-out past ~2.5s. A quorum retry adds up to `PROVIDER_RETRY_TIMEOUT_MS` per failed provider (parallel). Sync adds a 3s safety net that may return 504 before retry completes; stream relies on partial SSE updates and has no global cap.
+Provider I/O eats most of the budget. On the sync route, the 3s global timeout may return HTTP 504 before a quorum retry finishes. The stream route has no global cap — it relies on per-provider limits and streams partial results while waiting.
 
 ---
 
 ## Circuit breaker
 
-One breaker per provider in `run-provider-client.ts`. State machine in `circuit-breaker.ts`:
+One breaker per provider in `run-provider-client.ts`. Three states:
 
-- **Closed** — normal
-- **Open** after 3 consecutive failures — fail immediately for 30s, no upstream call
-- **Half-open** — single probe; success closes, failure reopens
+| State | What happens |
+|-------|-------------|
+| **Closed** | Normal — calls go through |
+| **Open** (after 3 consecutive failures) | Fail immediately for 30s — no upstream call |
+| **Half-open** | Single probe call; success → closed, failure → open again |
 
-When open, callers get `"Circuit breaker is open"` → `ProviderStatus.status: "error"`. We don't expose breaker internals to the client.
-
----
-
-## Quorum
-
-Need ≥2 of 3 providers with `status: "success"` **after** the initial fan-out and any quorum retry. Otherwise throw `QuorumError` → HTTP 503.
-
-| Outcome (final) | HTTP | `partialResults` |
-|-----------------|------|------------------|
-| 3/3 | 200 | false |
-| 2/3 | 200 | true |
-| 0–1/3 | 503 | n/a |
-
-**When retry runs:** only when attempt 1 yields `<2` successes. Providers that succeeded on attempt 1 are not called again.
-
-**Practical combos**
-
-- Sabre + HotelBeds (Amadeus down): flights + hotels, OK
-- Amadeus + HotelBeds (Sabre down): flights + hotels, OK
-- Sabre + Amadeus (HotelBeds down): flights only, no hotels → fails quorum unless cache has hotel data
-
-HotelBeds is our only hotel source. If it's down and we don't have a stale cache entry with hotels, we 503 even if both flight GDSs are fine. That's a product constraint, not a bug.
+When open, callers get `"Circuit breaker is open"` internally → `ProviderStatus.status: "error"`. Breaker internals are not exposed to the client.
 
 ---
 
 ## Provider isolation
 
-Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses contained promises: one rejection never cancels siblings. The orchestrator always waits for all three to settle (success, error, or timeout) before evaluating quorum and deciding whether to retry.
+Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses contained promises: one rejection never cancels siblings. The orchestrator waits for all three to settle (success, error, or timeout) before evaluating quorum.
 
 ---
 
@@ -68,17 +86,15 @@ Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses c
 
 | Layer | Policy |
 |-------|--------|
-| GDS/HotelBeds | One quorum retry — when fewer than 2 of 3 succeed, retry **only failed providers once** with `PROVIDER_RETRY_TIMEOUT_MS` (default 1000ms). Disable with `PROVIDER_QUORUM_RETRY=false`. |
+| GDS/HotelBeds | One quorum retry — when fewer than 2 of 3 succeed, retry **only failed providers once**. Disable with `PROVIDER_QUORUM_RETRY=false`. |
 | LLM | Fallback chain, not retry: OpenAI → contextual modify → regex mock |
 | Client | User can retry the whole search |
-| Cache | Stale-while-revalidate refreshes in background; not a provider retry |
+| Cache | Stale-while-revalidate refreshes in background — not a provider retry |
 
-### Quorum retry
-
-After the initial parallel fan-out, if quorum is not met (`<2` successes), the orchestrator retries each failed provider **once** with a shorter per-call timeout. Successful providers from the first attempt are kept; only failures are re-queried. There is **no third attempt** — one retry round per request, then success or `QuorumError`.
+### Quorum retry flow
 
 ```
-attempt 1 (parallel, PROVIDER_TIMEOUT_MS)
+attempt 1 (parallel, PROVIDER_TIMEOUT_MS = 2.5s)
     │
     ├─ ≥2 successes → rank, return 200
     │
@@ -86,7 +102,7 @@ attempt 1 (parallel, PROVIDER_TIMEOUT_MS)
            │
            ├─ PROVIDER_QUORUM_RETRY=false → QuorumError (503)
            │
-           └─ retry failed providers once (parallel, PROVIDER_RETRY_TIMEOUT_MS)
+           └─ retry failed providers once (parallel, PROVIDER_RETRY_TIMEOUT_MS = 1s)
                   │
                   ├─ ≥2 successes → rank, return 200
                   └─ still <2 → QuorumError (503)
@@ -102,17 +118,17 @@ attempt 1 (parallel, PROVIDER_TIMEOUT_MS)
 | Scenario | Attempts |
 |----------|----------|
 | Succeeds on attempt 1 | 1 |
-| Fails attempt 1, quorum already met (2/3 OK) | 1 (not retried) |
+| Fails attempt 1, but quorum already met (2/3 OK) | 1 (not retried) |
 | Fails attempt 1, quorum missed, retry enabled | 2 |
 | Fails both attempts | 2 → contributes to 503 |
 
-**Examples**
+**Worked examples**
 
 - Sabre + Amadeus fail transiently, HotelBeds OK (1/3) → retry Sabre + Amadeus → 3/3 if both recover.
 - Origin `ZZZ` (deterministic flight GDS failure) → retry Sabre + Amadeus → still fail → 503.
-- Sabre + HotelBeds OK, Amadeus down (2/3) → no retry; 200 with `partialResults: true`.
+- Sabre + HotelBeds OK, Amadeus down (2/3) → **no retry**; 200 with `partialResults: true`.
 
-Sync `POST /api/trips/search` may return **504** if the retry exhausts `GLOBAL_TIMEOUT_MS` (3s). Stream has no global cap — retries complete under per-provider limits and emit extra SSE `status` / `provider` / `offers_update` events.
+Sync `POST /api/trips/search` may return **504** if the retry exhausts `GLOBAL_TIMEOUT_MS` (3s). Stream has no global cap — retries complete under per-provider limits and emit extra SSE events.
 
 Logs emit `provider_quorum_retry` with the list of retried providers; retry results reuse `provider_result` with `attempt: 2`.
 
@@ -124,9 +140,7 @@ query → OpenAI (if key present and MOCK_LLM=false)
       → else: regex mock parser
 ```
 
-Sync `POST /api/trips/search` caps the first OpenAI attempt at `SYNC_LLM_PARSE_TIMEOUT_MS` (800ms default) so provider fan-out still fits the 3s global budget. Stream search uses the full `LLM_PARSE_TIMEOUT_MS` for free-form NL. On timeout or API error, sync falls back to regex parsing before returning 422.
-
-OpenAI requests include `prompt_cache_key` (`OPENAI_PROMPT_CACHE_KEY`, default `ziarah-trip-parse`) so the static system prompt + JSON schema prefix is cached server-side. Logs emit `cachedPromptTokens` on `llm_parse_complete` for hit-rate monitoring.
+Sync route caps the first OpenAI attempt at `SYNC_LLM_PARSE_TIMEOUT_MS` (800ms default) so provider fan-out still fits the 3s global budget. Stream search uses the full `LLM_PARSE_TIMEOUT_MS` for free-form natural language.
 
 Set `MOCK_LLM=true` or omit `OPENAI_API_KEY` to skip OpenAI entirely.
 

@@ -1,23 +1,32 @@
 # API Contract
 
-Request and response shapes for the trip search API. Types: `src/lib/types/trip.ts`. Request validation: `src/lib/api/trip-search-request.ts`.
+Request and response shapes for the trip search API.
+
+**Source of truth for types:** `src/lib/types/trip.ts`  
+**Request validation:** `src/lib/api/trip-search-request.ts`
 
 ---
 
-## Endpoints
+## Quick reference
 
-| Method | Path | Response |
-|--------|------|----------|
-| `POST` | `/api/trips/search` | `TripSearchResponse` JSON |
-| `POST` | `/api/trips/search/stream` | SSE (`text/event-stream`) |
-| `GET` | `/api/trips/{id}` | `TripSearchResponse` or 404 |
-| `GET` | `/api/health` | `HealthStatus` JSON |
+| Method | Path | What you get back |
+|--------|------|-------------------|
+| `POST` | `/api/trips/search` | One JSON object when the search finishes (or errors) |
+| `POST` | `/api/trips/search/stream` | A stream of JSON events as the search progresses |
+| `GET` | `/api/trips/{id}` | A previously stored search result |
+| `GET` | `/api/health` | Service health + Redis status |
+
+**Which endpoint should I use?**
+
+- Building the chat UI or anything interactive → **stream**
+- Writing tests, curl scripts, or a simple integration → **sync**
+- Reloading a past search by ID → **GET by id**
 
 ---
 
-## `POST /api/trips/search`
+## `POST /api/trips/search` (sync)
 
-Synchronous search. Global timeout applies (`GLOBAL_TIMEOUT_MS`, 3s in prod per `.env.example`).
+Waits for the full pipeline, then returns one JSON body. A global timeout applies (`GLOBAL_TIMEOUT_MS`, 3s in prod per `.env.example`).
 
 ### Request
 
@@ -37,7 +46,7 @@ X-Request-Id: 550e8400-e29b-41d4-a716-446655440000
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `query` | string | yes | 3–2000 chars |
-| `context` | `TripSearchParams` | no | Prior trip for modify/intent |
+| `context` | `TripSearchParams` | no | Prior trip for follow-up messages (e.g. "make it $5k") |
 
 ### Errors
 
@@ -45,17 +54,19 @@ X-Request-Id: 550e8400-e29b-41d4-a716-446655440000
 |--------|-------|--------------|
 | 400 | Zod validation | `{ "error": "Please check your search and try again." }` |
 | 422 | Parse failure | `{ "error": "We couldn't understand that trip request." }` |
-| 503 | Quorum failure (after quorum retry, if enabled) | `{ "error": "Search providers are temporarily unavailable." }` |
-| 504 | Global timeout (sync only; may occur during retry) | `{ "error": "Your search took too long. Please try again." }` |
+| 503 | Quorum failure (fewer than 2 of 3 providers succeeded) | `{ "error": "Search providers are temporarily unavailable." }` |
+| 504 | Global timeout (may occur during quorum retry) | `{ "error": "Your search took too long. Please try again." }` |
 | 500 | Unhandled | `{ "error": "Something went wrong. Please try again." }` |
 
-User-facing strings come from `src/lib/user-messages.ts`. Internals stay in server logs.
+User-facing strings come from `src/lib/user-messages.ts`. Internal details stay in server logs.
 
 ---
 
-## `POST /api/trips/search/stream`
+## `POST /api/trips/search/stream` (SSE)
 
-Same request body. No global timeout; providers capped at `PROVIDER_TIMEOUT_MS` on attempt 1 and `PROVIDER_RETRY_TIMEOUT_MS` on attempt 2 (quorum retry). Disable retry with `PROVIDER_QUORUM_RETRY=false`.
+Same request body. Returns **Server-Sent Events** — the server pushes JSON messages to the client as work completes. This is what the chat UI uses.
+
+**No global timeout** on this route. Each provider is still capped at `PROVIDER_TIMEOUT_MS` (attempt 1) and `PROVIDER_RETRY_TIMEOUT_MS` (attempt 2).
 
 ### Response headers
 
@@ -66,7 +77,7 @@ X-Request-Id: 550e8400-e29b-41d4-a716-446655440000
 X-Duration-Ms: 1842
 ```
 
-Framing: `data: {JSON}\n\n` per event.
+Each event is one line: `data: {JSON}\n\n`
 
 ### Event types
 
@@ -80,6 +91,15 @@ type TripSearchStreamEvent =
   | { type: "complete"; result: TripSearchResponse }
   | { type: "error"; message: string; status?: number };
 ```
+
+| Event | When it fires | What to do |
+|-------|---------------|------------|
+| `status` | Progress updates | Show a loading message |
+| `parsed` | Query understood | Optional — show parsed params |
+| `provider` | One provider finished | Show per-provider status |
+| `offers_update` | Offers changed | Re-render flight/hotel lists |
+| `complete` | Search done | Final result in `result` field |
+| `error` | Fatal failure | Show error message |
 
 ### Example stream
 
@@ -101,7 +121,7 @@ data: {"type":"offers_update","update":{"meta":{...},"flights":{...},"hotels":{.
 data: {"type":"complete","result":{...}}
 ```
 
-The `Retrying unavailable providers...` status and second-round `provider` events appear only when attempt 1 misses quorum and `PROVIDER_QUORUM_RETRY` is enabled. Clients should treat duplicate `provider` events for the same name as a status update (attempt 2 replaces attempt 1 in the final result).
+The `Retrying unavailable providers...` status only appears when attempt 1 misses quorum and `PROVIDER_QUORUM_RETRY` is enabled. If the same provider name appears twice, treat the second event as the updated status from attempt 2.
 
 Validation errors before the stream opens return `400` JSON, not SSE.
 
@@ -109,18 +129,18 @@ Validation errors before the stream opens return `400` JSON, not SSE.
 
 ## `GET /api/trips/{id}`
 
-Returns stored `TripSearchResponse` for `requestId`.
+Returns a stored `TripSearchResponse` for `requestId`.
 
 - `200` — found
 - `404` — `{ "error": "Trip not found" }`
 
-Results are stored in Redis (`trip:result:{requestId}`, 1h TTL). Survives pod restarts and is shared across replicas.
+Stored in Redis (`trip:result:{requestId}`, 1h TTL). Shared across pods.
 
 ---
 
 ## `GET /api/health`
 
-Used by K8s probes.
+Used by Kubernetes probes.
 
 ```json
 {
@@ -134,13 +154,15 @@ Used by K8s probes.
 }
 ```
 
-When Redis is unreachable, `status` is `"degraded"`, `redis` is `"error"`, and the response is HTTP 503 — K8s readiness treats this as not ready.
+When Redis is unreachable: `status` is `"degraded"`, `redis` is `"error"`, HTTP 503 — readiness probe fails.
 
 ---
 
 ## Core types
 
 ### `TripSearchParams`
+
+What the LLM (or regex parser) extracts from the user's query.
 
 ```typescript
 type TripSearchParams = {
@@ -225,6 +247,8 @@ type PublicHotelOffer = {
 
 ### `ProviderStatus`
 
+Per-provider outcome in `meta` and SSE `provider` events.
+
 ```typescript
 type ProviderStatus = {
   domain: "flights" | "hotels";
@@ -243,7 +267,7 @@ type TripSearchMeta = {
   providersQueried: number;
   providersSucceeded: number;
   providersFailed: number;
-  partialResults: boolean;
+  partialResults: boolean;   // true when 2/3 providers succeeded (one failed)
   cache: {
     status: "fresh" | "stale" | "miss" | "refreshing";
     cachedAt: string | null;
@@ -283,4 +307,4 @@ Full `raw` payloads stay server-side in `TripSearchResult` for booking/replay la
 
 ## Versioning
 
-Routes are unversioned (`/api/trips/...`). Breaking schema changes get a `/api/v1/...` prefix. Additive SSE event types are backward-compatible — clients ignore unknown `type` values.
+Routes are unversioned (`/api/trips/...`). Breaking schema changes would get a `/api/v1/...` prefix. Additive SSE event types are backward-compatible — clients should ignore unknown `type` values.
