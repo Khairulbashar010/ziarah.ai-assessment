@@ -1,15 +1,21 @@
 import { NextResponse } from "next/server";
 import { getProviderMockStatus } from "@/lib/providers/provider-mode";
+import { pingRedis } from "@/lib/storage/redis";
 
 export async function GET() {
   const providerMocks = getProviderMockStatus();
+  const redisOk = await pingRedis();
 
-  return NextResponse.json({
-    status: "ok",
-    service: "ziarah-trip-search",
-    timestamp: new Date().toISOString(),
-    mockProviders: process.env.MOCK_PROVIDERS !== "false",
-    providerMocks,
-    mockLlm: process.env.MOCK_LLM === "true",
-  });
+  return NextResponse.json(
+    {
+      status: redisOk ? "ok" : "degraded",
+      service: "ziarah-trip-search",
+      timestamp: new Date().toISOString(),
+      redis: redisOk ? "ok" : "error",
+      mockProviders: process.env.MOCK_PROVIDERS !== "false",
+      providerMocks,
+      mockLlm: process.env.MOCK_LLM === "true",
+    },
+    { status: redisOk ? 200 : 503 },
+  );
 }

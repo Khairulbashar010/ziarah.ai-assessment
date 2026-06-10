@@ -1,6 +1,19 @@
+import { randomUUID } from "node:crypto";
 import type { TripSearchCacheMeta, TripSearchParams, TripSearchResult } from "@/lib/types/trip";
 import { buildTripSearchCacheKey } from "@/lib/trip-search/cache-key";
 import { tripSearchCacheTtlMs } from "@/lib/trip-search/cache-policy";
+import {
+  QUERY_CACHE_REDIS_TTL_MULTIPLIER,
+  REFRESH_LOCK_TTL_SECONDS,
+  redisKeys,
+} from "@/lib/storage/redis-keys";
+import {
+  clearRedisNamespace,
+  redisDel,
+  redisExists,
+  redisGet,
+  redisSet,
+} from "@/lib/storage/redis";
 
 export type TripSearchCacheStatus = "fresh" | "stale" | "miss";
 
@@ -16,8 +29,13 @@ export type TripSearchCacheLookup = {
   entry: CachedTripSearchEntry | null;
 };
 
-const store = new Map<string, CachedTripSearchEntry>();
-const refreshLocks = new Map<string, Promise<TripSearchResult | null>>();
+function parseCachedEntry(raw: string): CachedTripSearchEntry | null {
+  try {
+    return JSON.parse(raw) as CachedTripSearchEntry;
+  } catch {
+    return null;
+  }
+}
 
 export function buildCacheMeta(
   status: TripSearchCacheMeta["status"],
@@ -47,14 +65,19 @@ export function buildCacheMeta(
   };
 }
 
-export function lookupTripSearchCache(
+export async function lookupTripSearchCache(
   params: TripSearchParams,
   now = Date.now(),
-): TripSearchCacheLookup {
+): Promise<TripSearchCacheLookup> {
   const cacheKey = buildTripSearchCacheKey(params);
-  const entry = store.get(cacheKey);
+  const raw = await redisGet(redisKeys.queryCache(cacheKey));
+  if (!raw) {
+    return { status: "miss", entry: null };
+  }
 
+  const entry = parseCachedEntry(raw);
   if (!entry) {
+    await redisDel(redisKeys.queryCache(cacheKey));
     return { status: "miss", entry: null };
   }
 
@@ -65,15 +88,22 @@ export function lookupTripSearchCache(
   return { status: "stale", entry };
 }
 
-export function saveTripSearchCache(params: TripSearchParams, result: TripSearchResult, now = Date.now()) {
+export async function saveTripSearchCache(
+  params: TripSearchParams,
+  result: TripSearchResult,
+  now = Date.now(),
+) {
   const cacheKey = buildTripSearchCacheKey(params);
   const ttlMs = tripSearchCacheTtlMs();
-
-  store.set(cacheKey, {
+  const entry: CachedTripSearchEntry = {
     cacheKey,
     result,
     cachedAt: now,
     expiresAt: now + ttlMs,
+  };
+
+  await redisSet(redisKeys.queryCache(cacheKey), JSON.stringify(entry), {
+    PX: ttlMs * QUERY_CACHE_REDIS_TTL_MULTIPLIER,
   });
 }
 
@@ -110,27 +140,58 @@ export function attachCacheMeta(
   };
 }
 
-export function getRefreshLock(cacheKey: string): Promise<TripSearchResult | null> | undefined {
-  return refreshLocks.get(cacheKey);
+async function waitForFreshCache(
+  params: TripSearchParams,
+  timeoutMs = 10_000,
+  pollMs = 100,
+): Promise<TripSearchResult | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const lookup = await lookupTripSearchCache(params);
+    if (lookup.status === "fresh" && lookup.entry) {
+      return lookup.entry.result;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  return null;
 }
 
-export function runWithRefreshLock(
+export async function isRefreshInProgress(cacheKey: string): Promise<boolean> {
+  return redisExists(redisKeys.refreshLock(cacheKey));
+}
+
+export async function runWithRefreshLock(
   cacheKey: string,
   refresh: () => Promise<TripSearchResult | null>,
+  paramsForWait?: TripSearchParams,
 ): Promise<TripSearchResult | null> {
-  const existing = refreshLocks.get(cacheKey);
-  if (existing) return existing;
-
-  const promise = refresh().finally(() => {
-    refreshLocks.delete(cacheKey);
+  const lockKey = redisKeys.refreshLock(cacheKey);
+  const lockToken = randomUUID();
+  const acquired = await redisSet(lockKey, lockToken, {
+    NX: true,
+    EX: REFRESH_LOCK_TTL_SECONDS,
   });
 
-  refreshLocks.set(cacheKey, promise);
-  return promise;
+  if (acquired !== "OK") {
+    if (paramsForWait) {
+      return waitForFreshCache(paramsForWait);
+    }
+    return null;
+  }
+
+  try {
+    return await refresh();
+  } finally {
+    const current = await redisGet(lockKey);
+    if (current === lockToken) {
+      await redisDel(lockKey);
+    }
+  }
 }
 
 /** Test helper */
-export function clearTripSearchCache() {
-  store.clear();
-  refreshLocks.clear();
+export async function clearTripSearchCache() {
+  await clearRedisNamespace();
 }

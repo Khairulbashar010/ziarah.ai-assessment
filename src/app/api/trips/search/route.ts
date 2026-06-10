@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { v4 as uuidv4 } from "uuid";
 import { tripSearchRequestSchema } from "@/lib/api/trip-search-request";
+import { resolveRequestId } from "@/lib/api/request-id";
 import { searchTrip, QuorumError } from "@/lib/orchestration/trip-search-service";
 import { toClientTripResponse } from "@/lib/trip-search/client-payload";
 import { withTimeout } from "@/lib/resilience/with-timeout";
@@ -15,7 +15,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { query, context } = tripSearchRequestSchema.parse(body);
-    const requestId = request.headers.get("x-request-id") ?? uuidv4();
+    const requestId = resolveRequestId(request.headers.get("x-request-id"));
 
     const result = await withTimeout(
       searchTrip(query, requestId, context),

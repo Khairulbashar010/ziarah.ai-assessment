@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
-import { v4 as uuidv4 } from "uuid";
 import { tripSearchRequestSchema } from "@/lib/api/trip-search-request";
+import { resolveRequestId } from "@/lib/api/request-id";
 import { searchTripStream, QuorumError } from "@/lib/orchestration/trip-search-service";
 import type { TripSearchStreamEvent } from "@/lib/trip-search/stream-events";
 import { toUserErrorMessage } from "@/lib/user-messages";
@@ -16,7 +16,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { query, context } = tripSearchRequestSchema.parse(body);
-    const requestId = request.headers.get("x-request-id") ?? uuidv4();
+    const requestId = resolveRequestId(request.headers.get("x-request-id"));
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {

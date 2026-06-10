@@ -1,8 +1,33 @@
+# Dependencies & build output
 node_modules
 .next
-.git
+out
+coverage
+coverage-report
+
+# Tests & dev tooling (not needed in production image)
+tests
+vitest.config.ts
+eslint.config.mjs
+
+# Documentation (keep README for reference)
 docs
+design-docs
 *.md
 !README.md
+
+# Local env & secrets
 .env*
+!.env.example
+
+# VCS & editor
+.git
+.gitignore
+.cursor
+.idea
+.vscode
+
+# Misc
+Dockerfile*
+docker-compose*.yml
 ziarah-trip

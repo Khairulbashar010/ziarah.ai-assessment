@@ -187,33 +187,39 @@ async function executeTripSearch(
   requestId: string,
   started: number,
 ): Promise<TripSearchResult> {
-  const lookup = lookupTripSearchCache(parsedQuery);
+  const lookup = await lookupTripSearchCache(parsedQuery);
 
   if (lookup.status === "fresh" && lookup.entry) {
     const cached = materializeCachedResult(lookup.entry, requestId, started, "fresh");
-    saveTripResult(cached);
+    await saveTripResult(cached);
     return cached;
   }
 
   if (lookup.status === "stale" && lookup.entry) {
-    void runWithRefreshLock(lookup.entry.cacheKey, async () => {
-      const refreshed = await refreshTripSearchCache(parsedQuery);
-      if (refreshed) {
-        saveTripSearchCache(parsedQuery, refreshed);
-      }
-      return refreshed;
+    void runWithRefreshLock(
+      lookup.entry.cacheKey,
+      async () => {
+        const refreshed = await refreshTripSearchCache(parsedQuery);
+        if (refreshed) {
+          await saveTripSearchCache(parsedQuery, refreshed);
+        }
+        return refreshed;
+      },
+      parsedQuery,
+    ).catch((error) => {
+      console.error("[trip-search] stale cache refresh failed", error);
     });
 
     const cached = materializeCachedResult(lookup.entry, requestId, started, "stale");
-    saveTripResult(cached);
+    await saveTripResult(cached);
     return cached;
   }
 
   const result = await finalizeTripSearch(parsedQuery, requestId, started);
-  saveTripSearchCache(parsedQuery, result);
-  saveTripResult(result);
+  await saveTripSearchCache(parsedQuery, result);
+  await saveTripResult(result);
 
-  const entry = lookupTripSearchCache(parsedQuery).entry;
+  const entry = (await lookupTripSearchCache(parsedQuery)).entry;
   return attachCacheMeta(result, "miss", entry);
 }
 
@@ -384,11 +390,11 @@ export async function* searchTripStream(
     throw new Error("Could not parse travel query");
   }
 
-  const cacheLookup = lookupTripSearchCache(parsedQuery);
+  const cacheLookup = await lookupTripSearchCache(parsedQuery);
 
   if (cacheLookup.status === "fresh" && cacheLookup.entry) {
     const cached = materializeCachedResult(cacheLookup.entry, requestId, started, "fresh");
-    saveTripResult(cached);
+    await saveTripResult(cached);
 
     yield {
       type: "status",
@@ -403,7 +409,7 @@ export async function* searchTripStream(
 
   if (cacheLookup.status === "stale" && cacheLookup.entry) {
     const cached = materializeCachedResult(cacheLookup.entry, requestId, started, "stale");
-    saveTripResult(cached);
+    await saveTripResult(cached);
 
     yield {
       type: "status",
@@ -413,18 +419,22 @@ export async function* searchTripStream(
     yield { type: "offers_update", update: toClientOffersUpdate(cached) };
     yield { type: "complete", result: toClientTripResponse(cached) };
 
-    const refreshed = await runWithRefreshLock(cacheLookup.entry.cacheKey, async () => {
-      const result = await refreshTripSearchCache(parsedQuery);
-      if (result) {
-        saveTripSearchCache(parsedQuery, result);
-      }
-      return result;
-    });
+    const refreshed = await runWithRefreshLock(
+      cacheLookup.entry.cacheKey,
+      async () => {
+        const result = await refreshTripSearchCache(parsedQuery);
+        if (result) {
+          await saveTripSearchCache(parsedQuery, result);
+        }
+        return result;
+      },
+      parsedQuery,
+    );
 
     if (refreshed) {
-      const entry = lookupTripSearchCache(parsedQuery).entry;
+      const entry = (await lookupTripSearchCache(parsedQuery)).entry;
       const updated = attachCacheMeta({ ...refreshed, requestId }, "fresh", entry);
-      saveTripResult(updated);
+      await saveTripResult(updated);
 
       yield { type: "status", message: "Prices updated", progress: 95 };
       yield { type: "offers_update", update: toClientOffersUpdate(updated) };
@@ -526,11 +536,11 @@ export async function* searchTripStream(
   }
 
   const result = assembleTripResponse(parsedQuery, requestId, started, providerResults);
-  saveTripSearchCache(parsedQuery, result);
+  await saveTripSearchCache(parsedQuery, result);
 
-  const entry = lookupTripSearchCache(parsedQuery).entry;
+  const entry = (await lookupTripSearchCache(parsedQuery)).entry;
   const withCache = attachCacheMeta(result, "miss", entry);
-  saveTripResult(withCache);
+  await saveTripResult(withCache);
 
   yield { type: "status", message: "Your trip is ready!", progress: 100 };
   yield { type: "complete", result: toClientTripResponse(withCache) };

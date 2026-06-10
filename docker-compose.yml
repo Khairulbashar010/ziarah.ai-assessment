@@ -1,7 +1,67 @@
 services:
-  trip-search:
-    build: .
+  redis:
+    image: redis:7-alpine
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  trip-search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ziarah/trip-search:local
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${HOST_PORT:-3000}:${PORT:-3000}"
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: ${PORT:-3000}
+      REDIS_URL: redis://redis:6379
+      # Mock-first defaults — override in .env for live provider / OpenAI keys
+      MOCK_PROVIDERS: ${MOCK_PROVIDERS:-true}
+      MOCK_LLM: ${MOCK_LLM:-true}
+      MOCK_LATENCY_MS_MIN: ${MOCK_LATENCY_MS_MIN:-200}
+      MOCK_LATENCY_MS_MAX: ${MOCK_LATENCY_MS_MAX:-800}
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
+      PROVIDER_TIMEOUT_MS: ${PROVIDER_TIMEOUT_MS:-2500}
+      GLOBAL_TIMEOUT_MS: ${GLOBAL_TIMEOUT_MS:-3000}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      LLM_PARSE_TIMEOUT_MS: ${LLM_PARSE_TIMEOUT_MS:-12000}
+      TRIP_SEARCH_CACHE_TTL_MS: ${TRIP_SEARCH_CACHE_TTL_MS:-300000}
+      CLIENT_MAX_FLIGHT_OFFERS: ${CLIENT_MAX_FLIGHT_OFFERS:-50}
+      CLIENT_MAX_HOTEL_OFFERS: ${CLIENT_MAX_HOTEL_OFFERS:-30}
+      SABRE_ENV: ${SABRE_ENV:-cert}
+      HOTELBEDS_BASE_URL: ${HOTELBEDS_BASE_URL:-https://api.test.hotelbeds.com}
+      AMADEUS_ENV: ${AMADEUS_ENV:-test}
+      # Secrets — set in .env (see .env.example)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MOCKAROO_API_KEY: ${MOCKAROO_API_KEY:-}
+      SABRE_CLIENT_ID: ${SABRE_CLIENT_ID:-}
+      SABRE_CLIENT_SECRET: ${SABRE_CLIENT_SECRET:-}
+      SABRE_PCC: ${SABRE_PCC:-}
+      AMADEUS_CLIENT_ID: ${AMADEUS_CLIENT_ID:-}
+      AMADEUS_CLIENT_SECRET: ${AMADEUS_CLIENT_SECRET:-}
+      HOTELBEDS_API_KEY: ${HOTELBEDS_API_KEY:-}
+      HOTELBEDS_API_SECRET: ${HOTELBEDS_API_SECRET:-}
     env_file:
-      - .env
+      - path: .env
+        required: false
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
