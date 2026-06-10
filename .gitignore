@@ -12,6 +12,8 @@
 
 # testing
 /coverage
+/cov-*
+/coverage-*
 /load/results/
 
 # next.js
