@@ -69,6 +69,84 @@ flowchart LR
 
 The sync route (`POST /api/trips/search`) runs the same pipeline but returns one JSON body and enforces a global timeout. Use it for tests and simple clients; the product UI should use SSE.
 
+### Request sequence (stream route)
+
+Primary path the chat UI uses — cache miss with all three providers succeeding. Provider completions can arrive in any order; each one triggers an incremental `offers_update`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant UI as Chat UI
+    participant API as API route
+    participant Orch as Orchestrator
+    participant LLM as OpenAI / regex
+    participant Redis
+    participant Sabre
+    participant Amadeus
+    participant HB as HotelBeds
+
+    Customer->>UI: Natural-language trip query
+    UI->>API: POST /api/trips/search/stream
+    API->>Orch: searchTripStream()
+
+    Orch->>LLM: parseTripQuery()
+    LLM-->>Orch: TripSearchParams
+    Orch-->>API: SSE parsed
+    API-->>UI: SSE parsed
+
+    Orch->>Redis: lookup (sha256 of params)
+
+    alt Cache fresh
+        Redis-->>Orch: hit
+        Orch->>Redis: saveTripResult(requestId)
+        Orch-->>API: offers_update + complete
+        API-->>UI: ranked offers
+    else Cache stale (SWR)
+        Redis-->>Orch: stale entry
+        Orch->>Redis: saveTripResult(requestId)
+        Orch-->>API: offers_update + complete (cached)
+        API-->>UI: ranked offers
+        Note over Orch,HB: Background refresh under trip:lock — same fan-out, optional follow-up SSE
+    else Cache miss
+        par Parallel fan-out (2.5s timeout + circuit breaker each)
+            Orch->>Sabre: searchFlights
+            Orch->>Amadeus: searchFlights
+            Orch->>HB: searchHotels
+        end
+
+        Note over Sabre,HB: Each provider returns in any order
+        Sabre-->>Orch: raw → normalize
+        Orch-->>API: SSE provider + offers_update
+        API-->>UI: partial ranked offers
+        Amadeus-->>Orch: raw → normalize
+        Orch-->>API: SSE provider + offers_update
+        HB-->>Orch: raw → normalize
+        Orch-->>API: SSE provider + offers_update
+
+        opt Quorum miss after attempt 1 (< 2/3 succeeded)
+            Orch-->>API: SSE status — Retrying unavailable providers...
+            Orch->>Sabre: retry failed only (1s timeout)
+            Orch->>Amadeus: retry failed only
+            Orch->>HB: retry failed only
+            Orch-->>API: SSE provider + offers_update
+        end
+
+        Orch->>Orch: rank + trip-level budget filter
+
+        alt Quorum OK (≥ 2/3 providers)
+            Orch->>Redis: saveTripSearchCache + saveTripResult
+            Orch-->>API: SSE complete
+            API-->>UI: final payload
+        else Quorum failed
+            Orch-->>API: SSE error
+            API-->>UI: HTTP 503
+        end
+    end
+
+    UI->>Customer: Render flights + hotels
+```
+
 ---
 
 ## Monolith
