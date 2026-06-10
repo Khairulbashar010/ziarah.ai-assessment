@@ -88,7 +88,7 @@ export function arcToSvgPath(points: LatLon[], width: number, height: number): s
 /** Midpoint along the great-circle arc between two coordinates. */
 export function greatCircleMidpoint(from: LatLon, to: LatLon): LatLon {
   const arc = greatCircleArc(from, to, 2);
-  return arc[1] ?? from;
+  return arc[1]!;
 }
 
 /** Convert a unit sphere vector back to WGS84 lat/lon. */

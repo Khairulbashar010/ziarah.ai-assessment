@@ -92,7 +92,7 @@ export async function saveTripSearchCache(
   params: TripSearchParams,
   result: TripSearchResult,
   now = Date.now(),
-) {
+): Promise<CachedTripSearchEntry> {
   const cacheKey = buildTripSearchCacheKey(params);
   const ttlMs = tripSearchCacheTtlMs();
   const entry: CachedTripSearchEntry = {
@@ -105,6 +105,8 @@ export async function saveTripSearchCache(
   await redisSet(redisKeys.queryCache(cacheKey), JSON.stringify(entry), {
     PX: ttlMs * QUERY_CACHE_REDIS_TTL_MULTIPLIER,
   });
+
+  return entry;
 }
 
 export function materializeCachedResult(

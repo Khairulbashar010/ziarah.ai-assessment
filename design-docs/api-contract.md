@@ -1,6 +1,6 @@
 # API Contract
 
-Request/response reference for the trip search API. Types live in `src/lib/types/trip.ts`; request validation in `src/lib/api/trip-search-request.ts`.
+Request and response shapes for the trip search API. Types: `src/lib/types/trip.ts`. Request validation: `src/lib/api/trip-search-request.ts`.
 
 ---
 
@@ -106,7 +106,7 @@ Returns stored `TripSearchResponse` for `requestId`.
 - `200` — found
 - `404` — `{ "error": "Trip not found" }`
 
-Results only exist server-side until the pod restarts (Redis will fix this in prod).
+Results are stored in Redis (`trip:result:{requestId}`, 1h TTL). Survives pod restarts and is shared across replicas.
 
 ---
 
@@ -119,11 +119,14 @@ Used by K8s probes.
   "status": "ok",
   "service": "ziarah-trip-search",
   "timestamp": "2026-06-10T12:00:00.000Z",
+  "redis": "ok",
   "mockProviders": true,
   "providerMocks": { "sabre": true, "amadeus": true, "hotelbeds": true },
   "mockLlm": true
 }
 ```
+
+When Redis is unreachable, `status` is `"degraded"`, `redis` is `"error"`, and the response is HTTP 503 — K8s readiness treats this as not ready.
 
 ---
 
@@ -272,4 +275,4 @@ Full `raw` payloads stay server-side in `TripSearchResult` for booking/replay la
 
 ## Versioning
 
-Not versioned yet. When we break schemas, add `/api/v1/...`. Additive SSE event types are backward-compatible (clients ignore unknown `type` values).
+Routes are unversioned (`/api/trips/...`). Breaking schema changes get a `/api/v1/...` prefix. Additive SSE event types are backward-compatible — clients ignore unknown `type` values.

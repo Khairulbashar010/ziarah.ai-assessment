@@ -1,4 +1,5 @@
 import { createClient, type RedisClientType } from "redis";
+import { logRedisError } from "@/lib/observability/logger";
 import { redisKeys } from "@/lib/storage/redis-keys";
 
 export type RedisSetOptions = {
@@ -27,7 +28,7 @@ export async function getRedis(): Promise<RedisClientType> {
     connectPromise = (async () => {
       const nextClient = createClient({ url: requireRedisUrl() });
       nextClient.on("error", (error) => {
-        console.error("[redis] client error", error);
+        logRedisError(error);
       });
       await nextClient.connect();
       client = nextClient;

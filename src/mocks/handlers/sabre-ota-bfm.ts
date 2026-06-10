@@ -91,7 +91,7 @@ function buildSegment(
     ArrivalDateTime: arrivalDateTime,
     StopQuantity: stops,
     FlightNumber: flightNumber,
-    ResBookDesigCode: stops === 0 ? "S" : "Q",
+    ResBookDesigCode: "S",
     ElapsedTime: elapsedTime,
     DepartureAirport: { LocationCode: origin, TerminalID: "0", content: "" },
     ArrivalAirport: { LocationCode: destination, TerminalID: "0", content: "" },

@@ -35,13 +35,10 @@ const FALLBACK_COORDS: Record<string, LatLon> = {
 
 /** Resolve any city/metro/IATA code to coordinates for map rendering. */
 export function resolveAirportLatLon(code: string, fallback: LatLon = FALLBACK_COORDS.LHR): LatLon {
-  const direct = getAirportCoords(code);
-  if (direct) return direct;
+  const coords = getAirportCoords(code);
+  if (coords) return coords;
 
   const resolved = resolveDisplayAirport(code);
-  const resolvedCoords = getAirportCoords(resolved);
-  if (resolvedCoords) return resolvedCoords;
-
   return FALLBACK_COORDS[resolved] ?? fallback;
 }
 

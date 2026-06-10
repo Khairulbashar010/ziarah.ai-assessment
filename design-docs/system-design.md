@@ -6,25 +6,25 @@
 
 ---
 
-## What we're building
+## What this is
 
 Ziarah users describe trips in plain language. This service parses that into structured search params, fans out to flight and hotel providers in parallel, normalizes the responses, ranks them, and returns a single payload the chat UI can render.
 
-**Providers today**
+**Providers**
 
 | Provider | Vertical | Integration |
 |----------|----------|-------------|
-| Sabre | Flights | BFM (live + mock) |
-| Amadeus | Flights | Mock only; live creds not wired yet |
-| HotelBeds | Hotels | Availability API (live + mock) |
+| Sabre | Flights | BFM — live sandbox + mock |
+| Amadeus | Flights | Mock by default; live adapter behind `MOCK_AMADEUS=false` |
+| HotelBeds | Hotels | Availability API — live sandbox + mock |
 
-HotelBeds is a bedbank, not a GDS. We run three provider calls per search and require at least two to succeed before returning 200.
+HotelBeds is a bedbank, not a GDS. Every search fans out to all three; at least two must succeed before we return 200.
 
 **Targets**
 
 - p95 end-to-end under 3s for cache misses
-- 10k concurrent users at peak (horizontal scale, not vertical)
-- Stateless pods; shared cache moves to Redis before multi-replica prod
+- 10k in-flight searches at peak in this module (~67k–125k whole-app concurrent users at 8–15% active-search ratio; horizontal scale, not vertical)
+- Stateless pods; Redis-backed cache and result store (required dependency)
 
 ---
 
@@ -32,15 +32,19 @@ HotelBeds is a bedbank, not a GDS. We run three provider calls per search and re
 
 ```mermaid
 flowchart LR
-    UI[Chat UI] --> API[API routes]
+    CUST[Customer] -->|trip query| UI[Chat UI]
+    UI -->|POST search| API[API routes]
     API --> ORCH[Orchestrator]
     ORCH --> LLM[LLM parser]
-    ORCH --> CACHE[(Query cache)]
+    ORCH --> CACHE[(Redis — query + results)]
     ORCH --> PROV[Provider clients]
     PROV --> NORM[Normalizers]
     NORM --> ORCH
     LLM --> OAI[OpenAI]
     PROV --> GDS[Sabre / Amadeus / HotelBeds]
+    ORCH -->|ranked offers| API
+    API -->|SSE stream| UI
+    UI -->|render results| CUST
 ```
 
 **Request path (stream route, which the UI uses):**
@@ -56,9 +60,9 @@ Sync route (`POST /api/trips/search`) is the same pipeline wrapped in a global t
 
 ---
 
-## Why a monolith
+## Monolith
 
-One Next.js deployable with clear module boundaries under `src/lib/`. At our scale the bottleneck is waiting on GDS and HotelBeds, not CPU. Splitting into microservices adds network hops inside a 3s budget without buying much.
+One Next.js deployable with module boundaries under `src/lib/`. The bottleneck is GDS and HotelBeds latency, not CPU — microservice splits add network hops inside a 3s budget without buying throughput.
 
 **Module map**
 
@@ -69,16 +73,11 @@ One Next.js deployable with clear module boundaries under `src/lib/`. At our sca
 | LLM | `src/lib/llm/` | OpenAI structured parse, regex fallback |
 | Providers | `src/lib/providers/` | Auth, live/mock clients, breaker wrapper |
 | Normalization | `src/lib/normalization/` | Provider JSON → unified offer types |
-| Storage | `src/lib/storage/` | In-memory cache + result store (Redis in prod) |
+| Storage | `src/lib/storage/` | Redis client, query cache, result store, refresh locks |
+| Observability | `src/lib/observability/` | pino logging, Prometheus `/api/metrics`, OTEL traces |
 | Resilience | `src/lib/resilience/` | `withTimeout`, `CircuitBreaker` |
 
-**When I'd split something out**
-
-- **Provider gateway** if we add more GDSs and credential/rate-limit logic gets messy.
-- **LLM service** if we run custom models or need GPU nodes separate from search pods.
-- **Booking service** when we add ticketing/PCI scope. Out of scope for search-only.
-
-Until then, one image, one deployment, one health check.
+**Extraction boundaries** (defined, not exercised): provider gateway for multi-GDS credential and rate-limit management; LLM service for self-hosted models; booking service for ticketing/PCI. Search runs as one image, one deployment, one health check.
 
 ---
 
@@ -161,25 +160,26 @@ We optimize for predictable latency over heroic recovery.
 
 **No retries on GDS calls.** A retry inside the same request usually blows the 3s budget. If the client retries the whole search, stale-while-revalidate may already have warmed the cache.
 
-**LLM fallback:** OpenAI → contextual modify (if `context` set) → regex mock parser.
+**LLM fallback:** OpenAI → contextual modify (if `context` set) → regex mock parser. Sync route caps the first OpenAI attempt at `SYNC_LLM_PARSE_TIMEOUT_MS` (800ms) so provider fan-out fits the 3s global budget; stream uses full `LLM_PARSE_TIMEOUT_MS`.
 
-**Partial success:** 2/3 providers OK → HTTP 200, `meta.partialResults: true`. 0–1/3 → 503.
+**Partial success:** 2/3 providers OK → HTTP 200, `meta.partialResults: true`. 0-1/3 → 503.
 
-Mock mode supports chaos testing: origin `ZZZ` kills flight providers, `destinationCode: "FAIL"` kills HotelBeds. Details in [resilience.md](./resilience.md).
+Mock mode supports chaos testing: origin `ZZZ` (or city `fail`) kills flight providers, `destinationCode: "FAIL"` kills HotelBeds. Details in [resilience.md](./resilience.md).
 
 ---
 
 ## Observability
 
-**Shipped now:** `console.error` on quorum/search failures, `GET /api/health`, `X-Request-Id` and `X-Duration-Ms` on SSE.
+- **Structured logging (pino)** — JSON to stdout, keyed on `requestId` + `route`; search lifecycle, provider results, quorum failures, LLM parse/fallback, Redis errors
+- **Log aggregation** — Promtail → Loki → Grafana; Trip Search Logs dashboard provisioned in Compose
+- **Metrics** — Prometheus scrape on `/api/metrics`: `trip_search_duration_ms`, `provider_duration_ms`, `quorum_failures_total`, `circuit_breaker_state`, cache hit ratio, `http_inflight_requests`
+- **Tracing** — OpenTelemetry span tree rooted at `trip.search`; children for `llm.parse`, each `provider.*`, `normalize`, `rank`
+- **Health** — `GET /api/health` includes Redis ping; returns 503 when Redis is down
+- **Correlation** — `X-Request-Id` and `X-Duration-Ms` on SSE responses
 
-**Not shipped yet (but planned before prod):**
+**Alerts:** p95 > 3s for 5 min, 503 rate > 5%, any circuit breaker open > 2 min, Redis unreachable > 1 min.
 
-- OpenTelemetry traces: root span `trip.search`, children for `llm.parse`, each `provider.*`, `normalize`, `rank`
-- Prometheus metrics: `trip_search_duration_ms`, `provider_duration_ms`, `quorum_failures_total`, `circuit_breaker_state`, cache hit ratio
-- Structured logging (pino) with `requestId` on every line; no query text or secrets in logs
-
-**Alerts I'd actually page on:** p95 > 3s for 5 min, 503 rate > 5%, any circuit breaker open > 2 min.
+**Load validation:** k6 scripts in `load/` — smoke, sync SLO (p95 < 3s), stream, and step-ramp capacity. See [load/README.md](../load/README.md).
 
 More detail: [observability.md](./observability.md).
 
@@ -189,13 +189,13 @@ More detail: [observability.md](./observability.md).
 
 Stateless pods behind an ingress (ALB or equivalent). ConfigMap for timeouts/TTL/model name; Secrets for provider keys and `REDIS_URL`.
 
-**Scaling back-of-envelope for 10k concurrent users**
+**Scaling model — 10k in-flight searches**
 
-Search is I/O-bound. Assume ~250 in-flight requests per pod at ~2s average duration → ~40 pods at peak. HPA min 4, max 40; CPU target 60% plus a custom `http_inflight_requests` metric if we wire it up.
+This module only — not total app concurrency. At 8–15% active-search ratio, 10k in-flight searches maps to ~67k–125k concurrent users on the whole app. Search is I/O-bound. Capacity is ~100 in-flight requests per pod at ~2s average duration → ~100 pods at peak. HPA min 4, max 100; CPU target 60% plus `http_inflight_requests` ~100/pod. Per-pod ceiling is measured with `load/capacity.js`. See [kubernetes.md](./kubernetes.md).
 
-Probes hit `GET /api/health`. Rolling update with `maxUnavailable: 0` so we don't drain capacity mid-deploy.
+Probes hit `GET /api/health` (readiness fails when Redis is unreachable). Rolling update with `maxUnavailable: 0` so we don't drain capacity mid-deploy.
 
-**Redis cutover:** In-memory `Map` caches work for single-pod dev. Multi-replica prod needs Redis for query cache, `requestId` → result lookup, and distributed refresh locks. Pod restart loses in-memory state; that's acceptable until Redis is live.
+**Redis:** Query cache (`trip:cache:*`), result store (`trip:result:*`, 1h TTL), and stale-refresh locks (`trip:lock:*`) all live in Redis. Pods are stateless; cache survives restarts and is shared across replicas. If Redis is down, searches still work but lose cache hits and cross-pod `GET /api/trips/{id}`.
 
 Manifests and env split: [kubernetes.md](./kubernetes.md).
 

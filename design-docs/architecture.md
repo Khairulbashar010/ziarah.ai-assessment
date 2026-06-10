@@ -1,18 +1,29 @@
 # Architecture
 
-Expands on [system-design.md](./system-design.md). Focus here is how code is organized and how data moves through it.
+Module layout and data flow for the trip search service. Expands on [system-design.md](./system-design.md).
 
 ---
 
 ## Context
 
 ```
-Traveler → Ziarah Trip Search (this repo) → OpenAI (parse)
-                                        → Sabre, Amadeus (flights)
-                                        → HotelBeds (hotels)
+Traveler ──query──► Ziarah Trip Search (this repo) ──► OpenAI (parse)
+                                                 ──► Sabre, Amadeus (flights)
+                                                 ──► HotelBeds (hotels)
+Traveler ◄─offers── Ziarah Trip Search (SSE stream or sync JSON)
 ```
 
 One deployable: Next.js standalone image serving both the landing/chat UI and API routes. No separate BFF.
+
+---
+
+## Data flow
+
+1. **Traveler** submits a natural-language query in `app/chat/`.
+2. **API route** validates the body and calls `streamTripSearch()` (product UI) or `searchTrip()` (sync clients/tests).
+3. **Orchestrator** parses → cache check → parallel provider fan-out → normalize → rank → quorum.
+4. **API route** returns ranked offers: SSE events (`provider`, `offers_update`, `complete`) on the stream path, or one JSON body on sync.
+5. **Chat UI** renders offers to the traveler as they arrive; `GET /api/trips/{id}` can hydrate history from the result store.
 
 ---
 
@@ -20,18 +31,26 @@ One deployable: Next.js standalone image serving both the landing/chat UI and AP
 
 ```
 src/
-  app/api/          HTTP handlers
-  app/chat/         Chat workspace UI
+  app/api/             HTTP handlers
+  app/chat/            Chat workspace UI
   lib/orchestration/   trip-search-service.ts — main pipeline
   lib/llm/             parse-trip-query.ts
   lib/providers/       sabre, amadeus, hotelbeds + run-provider-client.ts
   lib/normalization/   per-provider → Unified*Offer
-  lib/storage/         trip-query-cache, trip-results
+  lib/storage/         redis.ts, trip-query-cache, trip-results
+  lib/observability/   pino logger + API route constants
   lib/resilience/      with-timeout, circuit-breaker
   lib/types/           trip.ts — shared types
+
+tests/
+  unit/                Vitest — lib, API routes, mocks (mirrors src layout)
+  components/          UI unit tests
+
+observability/         Loki, Promtail, Grafana provisioning (Docker Compose)
+load/                  k6 scripts — SLO and per-pod capacity validation
 ```
 
-Modules talk through typed functions. The only shared mutable state is the storage layer (in-memory today, Redis later). Everything else is request-scoped.
+Modules talk through typed functions. Shared state lives in **Redis** (query cache, result store, refresh locks). Everything else is request-scoped.
 
 **Entry points the orchestrator exposes**
 
@@ -58,7 +77,7 @@ Both paths share parse → cache → fan-out → normalize → rank → quorum.
 
 **Sync** uses `Promise.all` on providers, then returns one JSON body. A global timeout wraps the whole thing.
 
-**Stream** uses a race loop: whichever provider finishes first emits SSE immediately. The UI gets partial offers while the slowest GDS is still working. No global timeout on the stream route; per-provider caps still apply.
+**Stream** uses a race loop: whichever provider finishes first emits SSE immediately. Partial offers reach the traveler through the chat UI while the slowest GDS is still working. No global timeout on the stream route; per-provider caps still apply.
 
 ---
 
@@ -68,37 +87,40 @@ Three layers, different jobs:
 
 | Layer | Key | TTL | Where |
 |-------|-----|-----|-------|
-| Query cache | SHA-256 of normalized `TripSearchParams` | 5 min fixed window | Server (per-pod → Redis) |
-| Result store | `requestId` | Until restart (→ 1h in Redis) | Server |
+| Query cache | `trip:cache:{sha256}` | 5 min logical; 15 min Redis PX (SWR headroom) | Redis |
+| Result store | `trip:result:{requestId}` | 1 hour | Redis |
+| Refresh lock | `trip:lock:{sha256}` | 30s (`SET NX EX`) | Redis |
 | Client | `requestId` in `sessionStorage` | Browser session | `ziarah-trip-results` |
 
-**Cache statuses**
+`REDIS_URL` is required — local dev, Docker Compose, and K8s all point at Redis.
+
+**Cache statuses** (in `meta.cache.status`)
 
 - `fresh` — return cached, no provider calls
-- `stale` — return cached, kick off background refresh (stale-while-revalidate)
+- `stale` — return cached immediately; background refresh under a distributed lock
 - `miss` — full fan-out
-- `refreshing` — another request is already refreshing; wait on the same lock
 
-Stale-while-revalidate is intentional: repeat searches with the same params stay fast even when a GDS is having a bad day.
+Concurrent stale refreshes dedupe via `trip:lock:*` — the waiter polls for a fresh entry (up to 10s) instead of fanning out again. Stale-while-revalidate keeps repeat searches fast even when a GDS is struggling.
 
 `GET /api/trips/{id}` reads the result store. Useful for deep links and chat history hydration.
 
 ---
 
-## Why not microservices (yet)
+## Service boundary
 
-| Concern | Reality for this service |
-|---------|--------------------------|
+This ships as a modular monolith — one Next.js image, clear module boundaries under `src/lib/`. The case for staying together:
+
+| Concern | Why one deployable |
+|---------|-------------------|
 | Latency | 3s budget; internal RPC adds 20–50ms per hop for no gain |
-| Team | Small; one repo is faster to ship and debug |
-| Scale | I/O-bound; add pods, not services |
+| Scale | I/O-bound; horizontal pod scaling, not service splits |
 | Ops | One Dockerfile, one HPA, one on-call runbook |
 
-**First thing I'd extract:** a provider gateway if we go past 3 GDS integrations or need per-provider rate limits and credential rotation without touching orchestration code.
+Extraction boundaries are defined but not exercised:
 
-**Second:** LLM parsing, if we move off hosted OpenAI to self-hosted models.
-
-**Third:** booking/ticketing — different SLA, PCI, long transactions. Not part of search.
+- **Provider gateway** — when credential rotation and per-GDS rate limits outgrow `src/lib/providers/`
+- **LLM service** — self-hosted models on GPU nodes, separate from search pods
+- **Booking service** — ticketing and PCI scope; outside search
 
 ---
 
@@ -108,7 +130,7 @@ Stale-while-revalidate is intentional: repeat searches with the same params stay
 |--------|--------|
 | Next.js 16 App Router | API + UI in one repo; `output: "standalone"` for Docker |
 | Zod | Validate LLM output and API bodies at runtime |
-| Vitest | 85+ tests on orchestration, providers, UI |
-| No DB | Search results are ephemeral; cache is the only persistence |
+| Vitest | 635+ tests under `tests/`; 80% coverage thresholds on `src/` |
+| Redis 7 | Shared query cache, result store, refresh locks — no relational DB |
 
 Provider auth is whatever they require: OAuth2 for Sabre/Amadeus, SHA256 signature for HotelBeds.

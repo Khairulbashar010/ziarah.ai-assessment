@@ -1,4 +1,42 @@
 services:
+  loki:
+    image: grafana/loki:3.4.2
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "${LOKI_HOST_PORT:-3100}:3100"
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.4.2
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./observability/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-positions:/tmp
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - "${GRAFANA_HOST_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     ports:
@@ -25,15 +63,18 @@ services:
       HOSTNAME: 0.0.0.0
       PORT: ${PORT:-3000}
       REDIS_URL: redis://redis:6379
-      # Mock-first defaults — override in .env for live provider / OpenAI keys
+      SERVICE_NAME: ziarah-trip-search
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Mock providers default on; LLM mode comes from .env only (see env_file below).
       MOCK_PROVIDERS: ${MOCK_PROVIDERS:-true}
-      MOCK_LLM: ${MOCK_LLM:-true}
       MOCK_LATENCY_MS_MIN: ${MOCK_LATENCY_MS_MIN:-200}
       MOCK_LATENCY_MS_MAX: ${MOCK_LATENCY_MS_MAX:-800}
       MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
       PROVIDER_TIMEOUT_MS: ${PROVIDER_TIMEOUT_MS:-2500}
       GLOBAL_TIMEOUT_MS: ${GLOBAL_TIMEOUT_MS:-3000}
+      SYNC_LLM_PARSE_TIMEOUT_MS: ${SYNC_LLM_PARSE_TIMEOUT_MS:-800}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_PROMPT_CACHE_KEY: ${OPENAI_PROMPT_CACHE_KEY:-ziarah-trip-parse}
       LLM_PARSE_TIMEOUT_MS: ${LLM_PARSE_TIMEOUT_MS:-12000}
       TRIP_SEARCH_CACHE_TTL_MS: ${TRIP_SEARCH_CACHE_TTL_MS:-300000}
       CLIENT_MAX_FLIGHT_OFFERS: ${CLIENT_MAX_FLIGHT_OFFERS:-50}
@@ -65,3 +106,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  k6:
+    image: grafana/k6:0.57.0
+    profiles: [loadtest]
+    volumes:
+      - ./load:/scripts:ro
+    environment:
+      BASE_URL: http://trip-search:${PORT:-3000}
+      K6_RAMP_VUS: ${K6_RAMP_VUS:-10}
+      K6_TARGET_VUS: ${K6_TARGET_VUS:-50}
+      K6_HOLD_DURATION: ${K6_HOLD_DURATION:-2m}
+      P95_SLO_MS: ${P95_SLO_MS:-3000}
+    depends_on:
+      trip-search:
+        condition: service_healthy
+    entrypoint: ["k6"]
+
+volumes:
+  loki-data:
+  promtail-positions:
+  grafana-data:

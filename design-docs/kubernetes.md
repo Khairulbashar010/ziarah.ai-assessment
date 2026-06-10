@@ -1,6 +1,6 @@
 # Kubernetes deployment
 
-How we'd run this in prod. Image: multi-stage Dockerfile → `node server.js` on port 3000.
+Production topology for the trip search service. Image: multi-stage Dockerfile → `node server.js` on port 3000.
 
 ---
 
@@ -20,26 +20,42 @@ Namespace: `ziarah-search`. ConfigMap for non-secret env; Secrets (or External S
 
 ## Scaling
 
-**Assumptions for 10k concurrent users**
+This deployment is the **trip search module** only — chat shell, auth, bookings, and payments run in other services. Peak load here is **in-flight searches** (concurrent `/api/trips/search*` requests), not total app concurrency.
 
-| Input | Value |
-|-------|-------|
-| In-flight searches per user | ~1 |
-| Avg search duration | ~2s |
-| Capacity per pod | ~250 in-flight |
-| Peak replicas | ~40 |
+In a conversational trip planner, most concurrent app users are reading results, typing, or comparing offers — not waiting on a search. During peak, roughly **8–15%** of whole-app sessions have an active search in flight.
 
-Search is I/O-bound. CPU alone is a poor HPA signal. Target 60% CPU *and* a custom `http_inflight_requests` metric (~100/pod) if we export it from the app.
+```text
+concurrent app users ≈ in-flight searches ÷ active-search ratio
+```
 
-HPA: min 4, max 40. Scale up fast (30s), scale down slow (5 min stabilization) to avoid flapping on traffic spikes.
+| Peak target (this module) | Implied whole-app concurrent users |
+|---------------------------|-------------------------------------|
+| **10k in-flight searches** | **~67k–125k** (at 8–15% active-search ratio) |
 
-| Replicas | ~Concurrent users (at 250 req/pod) |
-|----------|-------------------------------------|
-| 8 | 2k |
-| 16 | 4k |
-| 24 | 6k |
-| 32 | 8k |
-| 40 | 10k |
+**Capacity model — 10k in-flight searches**
+
+| Input | Value | Notes |
+|-------|-------|-------|
+| Peak in-flight searches | 10k | Module-local; one open search per active session |
+| Active-search ratio (whole app) | 8–15% | Browse/chat time between searches |
+| Avg search duration | ~2s | Blended hit/miss; p95 miss budget is 3s |
+| Capacity per pod | ~100 in-flight | On 512Mi / 1 CPU — measured via `load/capacity.js` |
+| HPA scale signal | ~100 in-flight/pod | Custom `http_inflight_requests` (see HPA manifest) |
+| Peak replicas | ~100 | 10k ÷ 100; provider rate limits may bind before pod count |
+
+Search is I/O-bound. CPU alone is a poor HPA signal. Target 60% CPU *and* `http_inflight_requests` (~100/pod).
+
+HPA: min 4, max 100. Scale up fast (30s), scale down slow (5 min stabilization) to avoid flapping on traffic spikes.
+
+| Replicas | ~In-flight searches (at 100/pod) | ~Whole-app users (at 10% active-search) |
+|----------|-----------------------------------|------------------------------------------|
+| 10 | 1k | ~10k |
+| 25 | 2.5k | ~25k |
+| 50 | 5k | ~50k |
+| 75 | 7.5k | ~75k |
+| 100 | 10k | ~100k |
+
+**Capacity notes:** Per-pod throughput is bounded by memory (offer payload size), outbound connection pools, upstream latency, and provider rate limits — often before Kubernetes runs out of pods. `load/capacity.js` step-ramps VUs on 512Mi / 1 CPU hardware to confirm the ~100 in-flight/pod assumption and tune HPA targets.
 
 ---
 
@@ -115,7 +131,7 @@ spec:
             periodSeconds: 5
 ```
 
-Pods are stateless. Rolling deploy with `maxUnavailable: 0` so capacity doesn't drop mid-release. In-memory cache is lost on restart; acceptable until Redis is live.
+Pods are stateless. Rolling deploy with `maxUnavailable: 0` so capacity doesn't drop mid-release. Query cache and result store live in Redis (ElastiCache), not pod memory — restarts don't evict cache entries.
 
 ---
 
@@ -146,7 +162,7 @@ spec:
     kind: Deployment
     name: ziarah-trip-search
   minReplicas: 4
-  maxReplicas: 40
+  maxReplicas: 100
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
@@ -213,11 +229,15 @@ MOCK_PROVIDERS: "false"
 MOCK_LLM: "false"
 PROVIDER_TIMEOUT_MS: "2500"
 GLOBAL_TIMEOUT_MS: "3000"
+SYNC_LLM_PARSE_TIMEOUT_MS: "800"
 LLM_PARSE_TIMEOUT_MS: "12000"
 TRIP_SEARCH_CACHE_TTL_MS: "300000"
 OPENAI_MODEL: "gpt-4o-mini"
+OPENAI_PROMPT_CACHE_KEY: "ziarah-trip-parse"
 CLIENT_MAX_FLIGHT_OFFERS: "50"
 CLIENT_MAX_HOTEL_OFFERS: "30"
+LOG_LEVEL: "info"
+SERVICE_NAME: "ziarah-trip-search"
 ```
 
 **Secrets (`trip-search-secrets`)**
@@ -234,29 +254,31 @@ Use External Secrets Operator or AWS Secrets Manager CSI. Don't commit secrets t
 
 ---
 
-## Redis cutover
+## Redis
 
-Dev uses in-process `Map` for query cache and result store. Multi-replica prod needs Redis:
+Redis is a **required dependency** — local dev, Docker Compose, and K8s all set `REDIS_URL`. Implementation: `src/lib/storage/redis.ts` + `redis-keys.ts`.
 
 | Store | Key pattern | TTL |
 |-------|-------------|-----|
-| Query cache | `trip:cache:{sha256}` | `TRIP_SEARCH_CACHE_TTL_MS` (5 min) |
-| Result store | `trip:result:{requestId}` | 1 hour |
-| Refresh lock | `trip:lock:{sha256}` | 30s |
+| Query cache | `trip:cache:{sha256}` | 5 min logical; Redis PX = 3× `TRIP_SEARCH_CACHE_TTL_MS` for stale headroom |
+| Result store | `trip:result:{requestId}` | 1 hour (`TRIP_RESULT_TTL_SECONDS`) |
+| Refresh lock | `trip:lock:{sha256}` | 30s (`SET NX EX`) |
 
-Stale-while-revalidate refresh locks need `SET NX EX` (or Redlock) so only one pod refreshes per cache key.
+Stale-while-revalidate uses distributed locks so only one pod refreshes per cache key; concurrent waiters poll for a fresh entry.
 
-If Redis goes down, searches still work; we just lose cache hits and `GET /api/trips/{id}` across pods. Run Redis Multi-AZ with automatic failover.
+`GET /api/health` pings Redis and returns 503 when unreachable — readiness fails so traffic routes to healthy pods only.
+
+If Redis goes down, live searches still work; cache hits and cross-pod `GET /api/trips/{id}` are lost. Run Redis Multi-AZ with automatic failover.
 
 ---
 
 ## CI/CD
 
 ```
-push → test + lint → docker build → trivy scan → ECR push → helm upgrade → smoke /api/health
+push → test + lint → docker build → trivy scan → ECR push → helm upgrade → k6 smoke + /api/health
 ```
 
-Gates: Vitest green, standalone build succeeds, no critical CVEs in the image, readiness probe passes after deploy.
+Gates: Vitest green (635+ tests, 80% coverage), standalone build succeeds, no critical CVEs in the image, `load/smoke.js` passes, readiness probe passes after deploy.
 
 ---
 
@@ -280,4 +302,4 @@ Gates: Vitest green, standalone build succeeds, no critical CVEs in the image, r
 | AZ loss | Reduced capacity | Multi-AZ node groups, PDB `minAvailable: 75%` |
 | Redis down | Cache misses only | Live search still works |
 | All GDS down | 503s | Serve stale cache if available; status page |
-| Region loss | Full outage | Multi-region is future work |
+| Region loss | Full outage | Single-region deployment; DR is out of scope for v1 |

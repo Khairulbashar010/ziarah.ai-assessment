@@ -33,6 +33,13 @@ import {
 } from "@/lib/orchestration/budget-filter";
 import { toProviderFanOutPayload } from "@/lib/llm/provider-payloads";
 import { rankFlightOffers, rankHotelOffers } from "@/lib/trip-search/rank-offers";
+import {
+  logCacheRefreshFailure,
+  logProviderResult,
+  logQuorumFailure,
+  requestLogger,
+} from "@/lib/observability/logger";
+import { API_ROUTES } from "@/lib/observability/api-routes";
 
 const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 2500);
 
@@ -142,8 +149,8 @@ export class QuorumError extends Error {
   }
 }
 
-function logQuorumFailure(details: QuorumFailureDetails) {
-  const failed = Object.entries(details.providers)
+function failedProvidersFromMap(providers: TripSearchResult["providers"]) {
+  return Object.entries(providers)
     .filter(([, status]) => status.status !== "success")
     .map(([name, status]) => ({
       name,
@@ -151,16 +158,6 @@ function logQuorumFailure(details: QuorumFailureDetails) {
       error: status.error,
       durationMs: status.durationMs,
     }));
-
-  console.error("[trip-search] quorum not met", {
-    requestId: details.requestId,
-    route: details.route,
-    providersSucceeded: details.providersSucceeded,
-    providersRequired: details.providersRequired,
-    providerTimeoutMs: details.providerTimeoutMs,
-    failedProviders: failed,
-    providers: details.providers,
-  });
 }
 
 export async function searchTrip(
@@ -169,7 +166,7 @@ export async function searchTrip(
   context?: TripSearchParams | null,
 ): Promise<TripSearchResult> {
   const started = Date.now();
-  const parsedQuery = await parseTripQuery(query, context);
+  const parsedQuery = await parseTripQuery(query, context, { mode: "sync" });
   return executeTripSearch(parsedQuery, requestId, started);
 }
 
@@ -177,7 +174,7 @@ async function refreshTripSearchCache(parsedQuery: TripSearchParams): Promise<Tr
   try {
     return await finalizeTripSearch(parsedQuery, uuidv4(), Date.now());
   } catch (error) {
-    console.error("[trip-search] cache refresh failed", error);
+    logCacheRefreshFailure(requestLogger(uuidv4(), API_ROUTES.search), error, "background");
     return null;
   }
 }
@@ -191,7 +188,7 @@ async function executeTripSearch(
 
   if (lookup.status === "fresh" && lookup.entry) {
     const cached = materializeCachedResult(lookup.entry, requestId, started, "fresh");
-    await saveTripResult(cached);
+    void saveTripResult(cached);
     return cached;
   }
 
@@ -207,19 +204,18 @@ async function executeTripSearch(
       },
       parsedQuery,
     ).catch((error) => {
-      console.error("[trip-search] stale cache refresh failed", error);
+      logCacheRefreshFailure(requestLogger(requestId, API_ROUTES.search), error, "stale");
     });
 
     const cached = materializeCachedResult(lookup.entry, requestId, started, "stale");
-    await saveTripResult(cached);
+    void saveTripResult(cached);
     return cached;
   }
 
   const result = await finalizeTripSearch(parsedQuery, requestId, started);
-  await saveTripSearchCache(parsedQuery, result);
-  await saveTripResult(result);
+  const entry = await saveTripSearchCache(parsedQuery, result);
+  void saveTripResult(result);
 
-  const entry = (await lookupTripSearchCache(parsedQuery)).entry;
   return attachCacheMeta(result, "miss", entry);
 }
 
@@ -364,7 +360,13 @@ function assembleTripResponse(
       route: `${parsedQuery.flights.origin} → ${parsedQuery.flights.destination}`,
       providers: buildProviderStatusMap(results),
     };
-    logQuorumFailure(details);
+    logQuorumFailure(requestLogger(requestId, API_ROUTES.search), {
+      providersSucceeded: details.providersSucceeded,
+      providersRequired: details.providersRequired,
+      providerTimeoutMs: details.providerTimeoutMs,
+      failedProviders: failedProvidersFromMap(details.providers),
+      durationMs: Date.now() - started,
+    });
     throw new QuorumError(details);
   }
 
@@ -509,6 +511,14 @@ export async function* searchTripStream(
     pending.delete(finished.name);
     providerResults.push(finished.result);
     completedProviders += 1;
+
+    logProviderResult(requestLogger(requestId, API_ROUTES.searchStream), {
+      provider: finished.name,
+      status: finished.result.status.status,
+      offerCount: finished.result.status.offerCount,
+      durationMs: finished.result.status.durationMs,
+      error: finished.result.status.error,
+    });
 
     yield {
       type: "provider",

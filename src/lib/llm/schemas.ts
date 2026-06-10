@@ -1,14 +1,54 @@
 import { z } from "zod";
 
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
-const iataCode = z.string().length(3);
+const iataCode = z
+  .string()
+  .regex(/^[A-Za-z]{3}$/)
+  .transform((code) => code.toUpperCase());
+
+const MAX_ADULTS = 9;
+const MAX_CHILDREN = 8;
+const MAX_INFANTS = 9;
+const MAX_OCCUPANCIES = 5;
+const MAX_ROOMS = 4;
+const MAX_DESTINATION_LENGTH = 200;
+
+const passengerCountSchema = z
+  .object({
+    adults: z.number().int().min(1).max(MAX_ADULTS),
+    children: z.number().int().min(0).max(MAX_CHILDREN),
+    infants: z.number().int().min(0).max(MAX_INFANTS),
+  })
+  .superRefine((passengers, ctx) => {
+    if (passengers.infants > passengers.adults) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Infants cannot exceed adults",
+        path: ["infants"],
+      });
+    }
+  });
+
+const occupancySchema = z.object({
+  rooms: z.number().int().min(1).max(MAX_ROOMS),
+  adults: z.number().int().min(1).max(MAX_ADULTS),
+  children: z.number().int().min(0).max(MAX_CHILDREN),
+  childAges: z.array(z.number().int().min(0).max(17)).max(MAX_CHILDREN).optional(),
+});
 
 const flightSearchPreferencesSchema = z
   .object({
     stops: z.enum(["any", "direct", "1", "2plus"]).optional(),
     sort: z.enum(["best", "price", "duration", "departure"]).optional(),
     refundableOnly: z.boolean().optional(),
-    airlines: z.array(z.string().length(2)).optional(),
+    airlines: z
+      .array(
+        z
+          .string()
+          .regex(/^[A-Za-z]{2}$/)
+          .transform((code) => code.toUpperCase()),
+      )
+      .optional(),
   })
   .optional();
 
@@ -26,32 +66,24 @@ export const tripSearchParamsSchema = z.object({
     destination: iataCode,
     departureDate: isoDate,
     returnDate: isoDate.optional(),
-    passengers: z.object({
-      adults: z.number().int().min(1),
-      children: z.number().int().min(0),
-      infants: z.number().int().min(0),
-    }),
+    passengers: passengerCountSchema,
     cabin: z.enum(["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"]),
     nonStop: z.boolean().optional(),
   }),
   hotels: z.object({
-    destination: z.string(),
+    destination: z.string().min(1).max(MAX_DESTINATION_LENGTH),
     destinationCode: iataCode,
     checkIn: isoDate,
     checkOut: isoDate,
-    occupancies: z.array(
-      z.object({
-        rooms: z.number().int().min(1),
-        adults: z.number().int().min(1),
-        children: z.number().int().min(0),
-        childAges: z.array(z.number().int()).optional(),
-      }),
-    ),
+    occupancies: z.array(occupancySchema).min(1).max(MAX_OCCUPANCIES),
   }),
   budget: z
     .object({
       maxTotal: z.number().positive(),
-      currency: z.string().length(3),
+      currency: z
+        .string()
+        .regex(/^[A-Za-z]{3}$/)
+        .transform((code) => code.toUpperCase()),
     })
     .optional(),
   tripType: z.enum(["ONE_WAY", "ROUND_TRIP"]),
@@ -62,6 +94,3 @@ export const tripSearchParamsSchema = z.object({
     })
     .optional(),
 });
-
-/** OpenAI structured-output schema (strip $schema before sending to the API). */
-export const tripSearchParamsJsonSchema = z.toJSONSchema(tripSearchParamsSchema);

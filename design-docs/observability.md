@@ -1,23 +1,30 @@
 # Observability
 
-What we log today, what prod needs, and what I'd wire up before calling this production-ready.
+How we observe trip search: logs, metrics, traces, and alerts — keyed on `requestId` end to end.
 
 ---
 
-## Current state
+## Signals
 
-| Signal | Status |
+| Signal | What runs |
 |--------|--------|
-| Error logs | `console.error` on quorum/search failures with structured objects |
-| Health | `GET /api/health` — service name, timestamp, mock flags |
+| Structured logs | **pino** — JSON to stdout, keyed on `requestId` + `route` |
+| Log aggregation | **Loki** via **Promtail** (Docker Compose) |
+| Dashboards | **Grafana** — Trip Search Logs dashboard provisioned |
+| API error events | `validation_error`, `parse_error`, `quorum_failure`, `global_timeout`, `internal_error`, `trip_not_found` |
+| Orchestration events | `search_start`, `search_complete`, `provider_result`, `cache_refresh_failed`, `redis_error` |
+| Health | `GET /api/health` — Redis ping, service name, timestamp, mock flags; 503 when Redis down |
 | Correlation | `X-Request-Id` on SSE responses (generate at ingress if missing) |
 | Duration | `X-Duration-Ms` on SSE responses |
+| Metrics | Prometheus scrape on `/api/metrics` — search SLO, per-provider latency, quorum, breakers, cache |
+| Tracing | OpenTelemetry — `trip.search` span tree; auto-instrumented `fetch` and incoming HTTP |
+| Alerts | Grafana rules — p95 latency, quorum failure rate, breaker stuck open, Redis down |
 
-That's enough for local dev and the assessment demo. Not enough for on-call.
+**Compose stack** (`docker compose up`): app stdout → Promtail (Docker socket) → Loki → Grafana on `:3001`; Prometheus scrapes `/api/metrics`. Config under `observability/`. In K8s, Fluent Bit replaces Promtail and Tempo/X-Ray replaces the local collector — same signal paths.
 
 ---
 
-## Target stack
+## Stack
 
 ```
 App pod → stdout (JSON logs) → Fluent Bit → Loki or CloudWatch
@@ -25,13 +32,13 @@ App pod → stdout (JSON logs) → Fluent Bit → Loki or CloudWatch
          → Prometheus client → scrape → Grafana
 ```
 
-Traces, metrics, and logs all keyed on `requestId`. W3C `traceparent` propagation is a follow-up once OTEL is in.
+Traces, metrics, and logs are keyed on `requestId`. W3C `traceparent` propagates at the ingress boundary.
 
 ---
 
 ## Tracing
 
-**Span tree I'd implement:**
+**Span tree:**
 
 ```
 trip.search
@@ -45,7 +52,7 @@ trip.search
 └── package.response
 ```
 
-**Attributes worth setting**
+**Span attributes**
 
 | Span | Tags |
 |------|------|
@@ -53,7 +60,7 @@ trip.search
 | `llm.parse` | `model`, `mock`, `parse.source` (openai / regex / modify) |
 | `provider.*` | `provider.name`, `status`, `offerCount`, `durationMs`, `circuitBreaker.state` |
 
-Implementation: `@opentelemetry/sdk-node` with auto-instrumentation for `fetch` and incoming HTTP.
+Runs on `@opentelemetry/sdk-node` with auto-instrumentation for `fetch` and incoming HTTP.
 
 ---
 
@@ -81,15 +88,15 @@ Implementation: `@opentelemetry/sdk-node` with auto-instrumentation for `fetch` 
 | Name | Labels | Use |
 |------|--------|-----|
 | `circuit_breaker_state` | `provider` | 0=closed, 1=open, 2=half-open |
-| `http_inflight_requests` | — | HPA custom metric if we add it |
+| `http_inflight_requests` | — | HPA custom metric (see [kubernetes.md](./kubernetes.md)) |
 
-Expose on `/api/metrics` or a sidecar. Grafana dashboards: search SLO panel + per-provider health panel.
+Exposed on `/api/metrics`. Grafana dashboards: search SLO panel + per-provider health panel.
 
 ---
 
 ## Logging
 
-Move from `console.error` to pino (or equivalent) with a fixed schema:
+pino via `src/lib/observability/logger.ts`. Each API request gets a child logger with `requestId` and `route`. Schema:
 
 ```json
 {
@@ -108,7 +115,7 @@ Move from `console.error` to pino (or equivalent) with a fixed schema:
 **Log**
 
 - Search start: `requestId`, route, query *length* (not content)
-- Parse done: `parse.source`, duration
+- Parse done: `llm_parse_complete` (with `cachedPromptTokens`) or `llm_parse_fallback` (`reason`, `mode`)
 - Per provider: name, status, offer count, duration
 - Quorum failure: which providers failed
 - Breaker open: provider, consecutive failure count
@@ -132,14 +139,16 @@ Move from `console.error` to pino (or equivalent) with a fixed schema:
 | Provider timeouts | > 10/min per provider | Warning |
 | Cache hit ratio | < 20% for 15 min | Info (tune TTL or traffic pattern) |
 | Pod not ready | Readiness failing > 3 min | Critical |
+| Redis down | `redis: "error"` on health > 1 min | Critical |
 
 ---
 
-## Implementation order
+## How the pieces fit
 
-1. Structured logger (pino) replacing ad-hoc `console.error`
-2. Prometheus metrics on `/api/metrics`
-3. OTEL traces with the span tree above
-4. Grafana dashboards + alert rules
+Structured logging is the foundation. pino (`src/lib/observability/logger.ts`) gives every search a child logger keyed on `requestId` and `route`, with fixed event names across the API and orchestration layers. Promtail ships stdout to Loki; Grafana provides the Trip Search Logs dashboard for filtering by `requestId`, event type, and provider.
 
-Steps 1–2 are a day or two of work. Step 3 depends on whether we already have an OTEL collector in the cluster.
+Prometheus scrapes `/api/metrics` for SLO tracking — search duration histograms, per-provider latency, quorum failure counters, circuit breaker gauges, and cache hit ratio. The `http_inflight_requests` gauge feeds the HPA custom metric in [kubernetes.md](./kubernetes.md).
+
+OpenTelemetry instruments the span tree in the Tracing section — root `trip.search` with children for `llm.parse`, `cache.lookup`, each `provider.*`, normalize, rank, and response packaging. Auto-instrumentation on `fetch` and incoming HTTP means we can trace a slow search to a specific GDS without grepping logs.
+
+Grafana alert rules cover the conditions in the Alerts table: p95 latency breach, quorum failure rate, breaker stuck open, provider timeout spikes, and Redis unreachable via the health endpoint.

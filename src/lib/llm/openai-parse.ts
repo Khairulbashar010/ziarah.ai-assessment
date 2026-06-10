@@ -1,13 +1,32 @@
 import { buildContextualUserMessage, TRIP_PARSE_SYSTEM_PROMPT } from "./parse-instructions";
 import { tripSearchParamsSchema } from "./schemas";
 import type { TripSearchParams } from "@/lib/types/trip";
+import { rootLogger, logLlmParseComplete } from "@/lib/observability/logger";
+
+type OpenAIChatUsage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+};
 
 type OpenAIChatResponse = {
   choices: Array<{ message: { content: string } }>;
+  usage?: OpenAIChatUsage;
 };
+
+export const DEFAULT_PROMPT_CACHE_KEY = "ziarah-trip-parse";
 
 const LLM_PARSE_TIMEOUT_MS = Number(process.env.LLM_PARSE_TIMEOUT_MS ?? 12_000);
 const LLM_MAX_OUTPUT_TOKENS = 400;
+
+export function resolvePromptCacheKey(): string {
+  const key = process.env.OPENAI_PROMPT_CACHE_KEY?.trim();
+  return key || DEFAULT_PROMPT_CACHE_KEY;
+}
+
+export type OpenAIChatRequestOptions = {
+  promptCacheKey?: string;
+};
 
 const isoDateSchema = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
 const nullableIsoDateSchema = { type: ["string", "null"], pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
@@ -22,15 +41,17 @@ const nullableAirlinesSchema = {
 const OPENAI_TRIP_SCHEMA = buildOpenAITripSchema();
 
 /** LLM extraction only — output is TripSearchParams, fan-out to Sabre/Amadeus/HotelBeds happens downstream. */
-function buildOpenAIRequestBody(
+export function buildOpenAIChatRequestBody(
   query: string,
   model: string,
   context?: TripSearchParams | null,
+  options?: OpenAIChatRequestOptions,
 ) {
   return {
     model,
     temperature: 0,
     max_tokens: LLM_MAX_OUTPUT_TOKENS,
+    prompt_cache_key: options?.promptCacheKey ?? resolvePromptCacheKey(),
     response_format: {
       type: "json_schema",
       json_schema: {
@@ -247,14 +268,19 @@ export function normalizeOpenAIParsedParams(raw: unknown): TripSearchParams {
   return parsed;
 }
 
+export type OpenAIParseMode = "sync" | "stream";
+
 export async function parseTripQueryWithOpenAI(
   query: string,
   apiKey: string,
   model: string,
   context?: TripSearchParams | null,
+  timeoutMs = LLM_PARSE_TIMEOUT_MS,
+  mode: OpenAIParseMode = "stream",
 ): Promise<TripSearchParams> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), LLM_PARSE_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const started = Date.now();
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -264,7 +290,7 @@ export async function parseTripQueryWithOpenAI(
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(buildOpenAIRequestBody(query, model, context)),
+      body: JSON.stringify(buildOpenAIChatRequestBody(query, model, context)),
     });
 
     if (!response.ok) {
@@ -278,10 +304,19 @@ export async function parseTripQueryWithOpenAI(
     const content = data.choices[0]?.message?.content;
     if (!content) throw new Error("Empty LLM response");
 
+    logLlmParseComplete(rootLogger, {
+      durationMs: Date.now() - started,
+      timeoutMs,
+      mode,
+      promptTokens: data.usage?.prompt_tokens,
+      completionTokens: data.usage?.completion_tokens,
+      cachedPromptTokens: data.usage?.prompt_tokens_details?.cached_tokens,
+    });
+
     return normalizeOpenAIParsedParams(JSON.parse(content));
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`OpenAI parse timed out after ${LLM_PARSE_TIMEOUT_MS}ms`);
+      throw new Error(`OpenAI parse timed out after ${timeoutMs}ms`);
     }
     throw error;
   } finally {

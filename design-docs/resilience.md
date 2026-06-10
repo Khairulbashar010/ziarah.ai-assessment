@@ -1,6 +1,6 @@
 # Failure handling
 
-How the service behaves when upstreams are slow, down, or flaky. Implementation: `src/lib/resilience/`, `src/lib/orchestration/trip-search-service.ts`, `src/lib/providers/run-provider-client.ts`.
+Latency bounds, circuit breakers, quorum rules, and degradation paths when upstreams are slow, down, or flaky. Code: `src/lib/resilience/`, `src/lib/orchestration/trip-search-service.ts`, `src/lib/providers/run-provider-client.ts`.
 
 ---
 
@@ -74,9 +74,13 @@ Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses c
 
 ```
 query → OpenAI (if key present and MOCK_LLM=false)
-      → on fail: applyTripModifications (if context)
+      → on fail/timeout: applyTripModifications (if context)
       → else: regex mock parser
 ```
+
+Sync `POST /api/trips/search` caps the first OpenAI attempt at `SYNC_LLM_PARSE_TIMEOUT_MS` (800ms default) so provider fan-out still fits the 3s global budget. Stream search uses the full `LLM_PARSE_TIMEOUT_MS` for free-form NL. On timeout or API error, sync falls back to regex parsing before returning 422.
+
+OpenAI requests include `prompt_cache_key` (`OPENAI_PROMPT_CACHE_KEY`, default `ziarah-trip-parse`) so the static system prompt + JSON schema prefix is cached server-side. Logs emit `cachedPromptTokens` on `llm_parse_complete` for hit-rate monitoring.
 
 Set `MOCK_LLM=true` or omit `OPENAI_API_KEY` to skip OpenAI entirely.
 
@@ -87,9 +91,10 @@ Set `MOCK_LLM=true` or omit `OPENAI_API_KEY` to skip OpenAI entirely.
 | Status | User sees | Provider calls |
 |--------|-----------|----------------|
 | fresh | Instant cached result | 0 |
-| stale | Instant cached result | 0 upfront; 3 async in background |
+| stale | Instant cached result | 0 upfront; background refresh under `trip:lock:*` |
 | miss | Full search | 3 parallel |
-| refreshing | Waits on in-flight refresh | 3 (deduped) |
+
+Concurrent stale refreshes dedupe via Redis `SET NX EX` locks — waiters poll for a fresh entry instead of fanning out again.
 
 Repeat queries with identical normalized params can return usable data even when live providers are struggling.
 
@@ -101,7 +106,7 @@ For CI and local testing without live GDS spend:
 
 | Trigger | Effect |
 |---------|--------|
-| Origin `ZZZ` | Sabre + Amadeus fail |
+| Origin `ZZZ` (or city `fail` → resolves to `ZZZ`) | Sabre + Amadeus fail |
 | Origin `ERR` | Sabre + Amadeus validation error |
 | `destinationCode` `FAIL` | HotelBeds fail |
 | `destinationCode` `ERR` | HotelBeds validation error |

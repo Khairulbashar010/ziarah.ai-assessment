@@ -16,6 +16,18 @@ export const METRO_CITIES: Record<string, MetroCity> = {
   barcelona: { name: "Barcelona", searchCode: "BCN", displayAirport: "BCN" },
   amsterdam: { name: "Amsterdam", searchCode: "AMS", displayAirport: "AMS" },
   singapore: { name: "Singapore", searchCode: "SIN", displayAirport: "SIN" },
+  berlin: { name: "Berlin", searchCode: "BER", displayAirport: "SXF" },
+  seoul: { name: "Seoul", searchCode: "SEL", displayAirport: "ICN" },
+  "san francisco": { name: "San Francisco", searchCode: "SFO", displayAirport: "SFO" },
+  chicago: { name: "Chicago", searchCode: "CHI", displayAirport: "ORD" },
+  toronto: { name: "Toronto", searchCode: "YYZ", displayAirport: "YYZ" },
+  mumbai: { name: "Mumbai", searchCode: "BOM", displayAirport: "BOM" },
+  madrid: { name: "Madrid", searchCode: "MAD", displayAirport: "MAD" },
+  lisbon: { name: "Lisbon", searchCode: "LIS", displayAirport: "LIS" },
+  sydney: { name: "Sydney", searchCode: "SYD", displayAirport: "SYD" },
+  bali: { name: "Bali", searchCode: "DPS", displayAirport: "DPS" },
+  cancun: { name: "Cancun", searchCode: "CUN", displayAirport: "CUN" },
+  "los angeles": { name: "Los Angeles", searchCode: "LAX", displayAirport: "LAX" },
   fail: { name: "Fail", searchCode: "ZZZ", displayAirport: "ZZZ" },
 };
 

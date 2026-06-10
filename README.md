@@ -26,6 +26,12 @@ docker compose up --build
 
 App on [http://localhost:3000](http://localhost:3000). Health: `GET /api/health` — expect `redis: "ok"`.
 
+**Logs.** The stack includes Grafana + Loki + Promtail. App logs are structured JSON (pino) on stdout; Promtail ships them to Loki.
+
+- Grafana: [http://localhost:3001](http://localhost:3001) — `admin` / `admin` (override via `GRAFANA_ADMIN_*` in `.env`)
+- Dashboard: **Trip Search → Trip Search Logs** — errors, events, filter by `requestId`
+- Correlate API responses using `X-Request-Id` → paste into the dashboard variable
+
 
 ### Local development
 
@@ -70,6 +76,22 @@ curl -X POST http://localhost:3000/api/trips/search \
 ```bash
 npm test
 ```
+
+**Load tests** ([k6](https://k6.io/) — install locally, or use Docker against the Compose stack):
+
+```bash
+# Local — app must be running (e.g. npm run start)
+npm run loadtest:smoke      # quick sanity check
+npm run loadtest:sync       # p95 vs 3s SLO, ramp to 50 VUs
+npm run loadtest:capacity   # step-ramp to ~100 VUs — per-pod estimate
+
+# Docker — docker compose up first; hits trip-search on the Compose network
+npm run loadtest:docker:smoke
+npm run loadtest:docker:sync
+npm run loadtest:docker:capacity
+```
+
+See [load/README.md](load/README.md) for tuning and K8s-scale runs.
 
 ### Operating modes
 

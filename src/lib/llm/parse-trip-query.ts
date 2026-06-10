@@ -1,4 +1,5 @@
 import type { TripSearchParams } from "@/lib/types/trip";
+import { rootLogger, logLlmParseFallback } from "@/lib/observability/logger";
 import { getAirportByCode, resolveAirportCode } from "@/lib/geo/airports";
 import { resolveMetroCity } from "@/lib/geo/metro-cities";
 import { nightsBetween } from "@/lib/utils/dates";
@@ -134,17 +135,51 @@ function llmModel(): string {
   return process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 }
 
+const LLM_PARSE_TIMEOUT_MS = Number(process.env.LLM_PARSE_TIMEOUT_MS ?? 12_000);
+export const SYNC_LLM_PARSE_TIMEOUT_MS = Number(process.env.SYNC_LLM_PARSE_TIMEOUT_MS ?? 800);
+
+export type ParseTripQueryOptions = {
+  /** Sync search passes SYNC_LLM_PARSE_TIMEOUT_MS; stream omits for full LLM_PARSE_TIMEOUT_MS. */
+  llmTimeoutMs?: number;
+  mode?: "sync" | "stream";
+};
+
+function resolveLlmTimeoutMs(options?: ParseTripQueryOptions): number {
+  if (options?.llmTimeoutMs !== undefined) {
+    return options.llmTimeoutMs;
+  }
+  return options?.mode === "sync" ? SYNC_LLM_PARSE_TIMEOUT_MS : LLM_PARSE_TIMEOUT_MS;
+}
+
 async function tryLlmParse(
   query: string,
   context?: TripSearchParams | null,
+  options?: ParseTripQueryOptions,
 ): Promise<TripSearchParams | null> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
 
+  const timeoutMs = resolveLlmTimeoutMs(options);
+  const mode = options?.mode ?? "stream";
+
   const { parseTripQueryWithOpenAI } = await import("./openai-parse");
   try {
-    return await parseTripQueryWithOpenAI(query, apiKey, llmModel(), context);
-  } catch {
+    return await parseTripQueryWithOpenAI(
+      query,
+      apiKey,
+      llmModel(),
+      context,
+      timeoutMs,
+      mode,
+    );
+  } catch (error) {
+    const timedOut =
+      error instanceof Error && error.message.includes("timed out after");
+    logLlmParseFallback(rootLogger, {
+      reason: timedOut ? "timeout" : "error",
+      timeoutMs,
+      mode,
+    });
     return null;
   }
 }
@@ -159,9 +194,27 @@ function tryFastParsePaths(
 export async function parseTripQuery(
   query: string,
   context?: TripSearchParams | null,
+  options?: ParseTripQueryOptions,
 ): Promise<TripSearchParams> {
+  // Sync search must stay inside GLOBAL_TIMEOUT_MS — regex handles scripted queries first.
+  if (options?.mode === "sync") {
+    const fast = tryFastParsePaths(query, context);
+    if (fast) return fast;
+
+    if (shouldUseLlmFirst()) {
+      const llm = await tryLlmParse(query, context, options);
+      if (llm) return llm;
+    }
+
+    throw new Error(
+      shouldUseLlmFirst()
+        ? "Could not parse query"
+        : "Could not parse query and OPENAI_API_KEY is not set",
+    );
+  }
+
   if (shouldUseLlmFirst()) {
-    const llm = await tryLlmParse(query, context);
+    const llm = await tryLlmParse(query, context, options);
     if (llm) return llm;
   }
 
@@ -198,7 +251,7 @@ export async function* streamParseTripQuery(
       progress: 15,
     };
 
-    const llm = await tryLlmParse(query, context);
+    const llm = await tryLlmParse(query, context, { mode: "stream" });
     if (llm) {
       yield { type: "parsed", params: llm };
       return;
