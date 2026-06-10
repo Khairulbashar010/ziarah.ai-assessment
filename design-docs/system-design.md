@@ -54,7 +54,8 @@ flowchart LR
 3. Cache lookup on a SHA-256 key of normalized params. Fresh hit returns immediately; stale hit returns cached data and refreshes in the background.
 4. On miss: Sabre, Amadeus, and HotelBeds run in parallel, each behind a per-provider timeout and circuit breaker.
 5. Each completion normalizes offers and pushes an SSE `provider` + `offers_update` event.
-6. Orchestrator ranks, applies trip-level budget filter, checks quorum (≥2/3), writes cache, emits `complete`.
+6. If fewer than 2 of 3 succeed, retry **only failed providers once** (`PROVIDER_RETRY_TIMEOUT_MS`, default 1s). Stream emits `"Retrying unavailable providers..."` plus additional `provider` / `offers_update` events.
+7. Orchestrator ranks, applies trip-level budget filter, checks quorum (≥2/3), writes cache, emits `complete`.
 
 Sync route (`POST /api/trips/search`) is the same pipeline wrapped in a global timeout. Useful for tests and simple clients; the product UI should use SSE.
 
@@ -69,7 +70,7 @@ One Next.js deployable with module boundaries under `src/lib/`. The bottleneck i
 | Area | Path | Owns |
 |------|------|------|
 | HTTP | `src/app/api/` | Validation, status codes, SSE framing |
-| Orchestration | `src/lib/orchestration/` | Parse → cache → fan-out → rank → quorum |
+| Orchestration | `src/lib/orchestration/` | Parse → cache → fan-out → quorum retry → rank → quorum |
 | LLM | `src/lib/llm/` | OpenAI structured parse, regex fallback |
 | Providers | `src/lib/providers/` | Auth, live/mock clients, breaker wrapper |
 | Normalization | `src/lib/normalization/` | Provider JSON → unified offer types |
@@ -140,8 +141,8 @@ Raw provider payloads never leave the server. Client gets `PublicFlightOffer` / 
 |------|------|
 | 400 | Bad request body |
 | 422 | Couldn't parse the query |
-| 503 | Fewer than 2 providers succeeded |
-| 504 | Sync route global timeout |
+| 503 | Fewer than 2 providers succeeded after quorum retry |
+| 504 | Sync route global timeout (may occur during retry) |
 | 500 | Unexpected |
 
 ---
@@ -152,17 +153,19 @@ We optimize for predictable latency over heroic recovery.
 
 | Mechanism | Setting | Why |
 |-----------|---------|-----|
-| Per-provider timeout | 2.5s (`PROVIDER_TIMEOUT_MS`) | Slow GDS can't hold the whole search |
-| Global timeout | 3s prod (`GLOBAL_TIMEOUT_MS`), sync only | Hard ceiling for non-stream clients |
+| Per-provider timeout | 2.5s (`PROVIDER_TIMEOUT_MS`) | Slow GDS can't hold the whole search (attempt 1) |
+| Quorum retry timeout | 1s (`PROVIDER_RETRY_TIMEOUT_MS`) | Shorter cap on attempt 2 for failed providers only |
+| Global timeout | 3s prod (`GLOBAL_TIMEOUT_MS`), sync only | Hard ceiling for non-stream clients (includes retry) |
 | Circuit breaker | 3 failures → open 30s, per provider | Stop hammering a dead upstream |
 | Quorum | 2 of 3 must succeed | Need flights from at least one GDS plus hotels, or equivalent via cache |
+| Quorum retry | One round, failed providers only | Recover transient blips without a full client re-search |
 | Provider isolation | Separate try/catch per call | One failure doesn't cancel the others |
 
-**No retries on GDS calls.** A retry inside the same request usually blows the 3s budget. If the client retries the whole search, stale-while-revalidate may already have warmed the cache.
+**One quorum retry on GDS calls.** When fewer than 2 of 3 providers succeed, failed providers are retried once with a shorter timeout (`PROVIDER_RETRY_TIMEOUT_MS`, default 1s). Sync may still hit the 3s global cap; stream has no global limit. Disable with `PROVIDER_QUORUM_RETRY=false`. See [resilience.md](./resilience.md).
 
 **LLM fallback:** OpenAI → contextual modify (if `context` set) → regex mock parser. Sync route caps the first OpenAI attempt at `SYNC_LLM_PARSE_TIMEOUT_MS` (800ms) so provider fan-out fits the 3s global budget; stream uses full `LLM_PARSE_TIMEOUT_MS`.
 
-**Partial success:** 2/3 providers OK → HTTP 200, `meta.partialResults: true`. 0-1/3 → 503.
+**Partial success:** 2/3 providers OK → HTTP 200, `meta.partialResults: true`. 0-1/3 after retry → 503.
 
 Mock mode supports chaos testing: origin `ZZZ` (or city `fail`) kills flight providers, `destinationCode: "FAIL"` kills HotelBeds. Details in [resilience.md](./resilience.md).
 
@@ -170,7 +173,7 @@ Mock mode supports chaos testing: origin `ZZZ` (or city `fail`) kills flight pro
 
 ## Observability
 
-- **Structured logging (pino)** — JSON to stdout, keyed on `requestId` + `route`; search lifecycle, provider results, quorum failures, LLM parse/fallback, Redis errors
+- **Structured logging (pino)** — JSON to stdout, keyed on `requestId` + `route`; search lifecycle, provider results, quorum retry (`provider_quorum_retry`), quorum failures, LLM parse/fallback, Redis errors
 - **Log aggregation** — Promtail → Loki → Grafana; Trip Search Logs dashboard provisioned in Compose
 - **Metrics** — Prometheus scrape on `/api/metrics`: `trip_search_duration_ms`, `provider_duration_ms`, `quorum_failures_total`, `circuit_breaker_state`, cache hit ratio, `http_inflight_requests`
 - **Tracing** — OpenTelemetry span tree rooted at `trip.search`; children for `llm.parse`, each `provider.*`, `normalize`, `rank`
@@ -206,10 +209,12 @@ Manifests and env split: [kubernetes.md](./kubernetes.md).
 | Phase | Budget |
 |-------|--------|
 | LLM parse | ~800ms |
-| Provider fan-out (parallel) | ~1500ms p95 |
+| Provider fan-out (parallel, attempt 1) | ~1500ms p95 |
+| Quorum retry (optional, attempt 2) | up to ~1000ms per failed provider |
 | Normalize + rank | ~50ms |
 | Ingress | ~20ms |
-| **Total (miss)** | **< 3s p95** |
+| **Total (miss, no retry)** | **< 3s p95** |
+| **Total (miss + retry)** | may exceed 3s on stream; sync capped by `GLOBAL_TIMEOUT_MS` |
 | Cache hit | < 100ms |
 
 ---
@@ -218,9 +223,10 @@ Manifests and env split: [kubernetes.md](./kubernetes.md).
 
 1. **HotelBeds for hotels** — matches how Ziarah actually distributes hotel inventory.
 2. **2-of-3 quorum** — two flight GDSs are redundant; hotels depend on HotelBeds unless we have a stale cache entry with hotel data.
-3. **SSE-first** — users see provider results as they land instead of staring at a spinner for 3s.
-4. **Trip-level budget** — filter applied after ranking across flights + hotels, not per vertical.
-5. **Provider-native mocks** — normalization is tested against realistic payloads without live API spend.
+3. **One quorum retry** — when attempt 1 misses quorum, only failed providers get a single shorter retry; no retry loop.
+4. **SSE-first** — users see provider results as they land instead of staring at a spinner for 3s.
+5. **Trip-level budget** — filter applied after ranking across flights + hotels, not per vertical.
+6. **Provider-native mocks** — normalization is tested against realistic payloads without live API spend.
 
 ---
 

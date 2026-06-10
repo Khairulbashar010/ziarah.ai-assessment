@@ -35,13 +35,21 @@ import { toProviderFanOutPayload } from "@/lib/llm/provider-payloads";
 import { rankFlightOffers, rankHotelOffers } from "@/lib/trip-search/rank-offers";
 import {
   logCacheRefreshFailure,
+  logProviderQuorumRetry,
   logProviderResult,
   logQuorumFailure,
   requestLogger,
 } from "@/lib/observability/logger";
 import { API_ROUTES } from "@/lib/observability/api-routes";
+import type { ProviderFanOutPayload } from "@/lib/llm/provider-payloads";
 
 const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 2500);
+const PROVIDER_RETRY_TIMEOUT_MS = Number(process.env.PROVIDER_RETRY_TIMEOUT_MS ?? 1000);
+const QUORUM_REQUIRED = 2;
+
+function isProviderQuorumRetryEnabled(): boolean {
+  return process.env.PROVIDER_QUORUM_RETRY !== "false";
+}
 
 type ProviderName = "sabre" | "amadeus" | "hotelbeds";
 
@@ -58,16 +66,48 @@ type ProviderRunResult = {
   hotels: UnifiedHotelOffer[];
 };
 
+type ProviderJobSpec = {
+  name: ProviderName;
+  domain: ProviderStatus["domain"];
+  fn: () => Promise<unknown>;
+  normalize: (raw: unknown) => UnifiedFlightOffer[] | UnifiedHotelOffer[];
+};
+
+function buildProviderJobSpecs(providers: ProviderFanOutPayload): ProviderJobSpec[] {
+  return [
+    {
+      name: "sabre",
+      domain: "flights",
+      fn: () => searchSabreFlights(providers.sabre),
+      normalize: normalizeSabreFlights,
+    },
+    {
+      name: "amadeus",
+      domain: "flights",
+      fn: () => searchAmadeusFlights(providers.amadeus),
+      normalize: normalizeAmadeusFlights,
+    },
+    {
+      name: "hotelbeds",
+      domain: "hotels",
+      fn: () => searchHotelBedsHotels(providers.hotelbeds),
+      normalize: (raw) =>
+        normalizeHotelBedsHotels(raw, providers.hotelbeds.checkIn, providers.hotelbeds.checkOut),
+    },
+  ];
+}
+
 async function runProvider(
   name: ProviderName,
   domain: ProviderStatus["domain"],
   fn: () => Promise<unknown>,
   normalize: (raw: unknown) => UnifiedFlightOffer[] | UnifiedHotelOffer[],
+  timeoutMs = PROVIDER_TIMEOUT_MS,
 ): Promise<ProviderRunResult> {
   const start = Date.now();
 
   try {
-    const raw = await withTimeout(fn(), PROVIDER_TIMEOUT_MS, name);
+    const raw = await withTimeout(fn(), timeoutMs, name);
     const offers = normalize(raw);
 
     return {
@@ -95,6 +135,63 @@ async function runProvider(
       hotels: [],
     };
   }
+}
+
+function countSucceededProviders(results: ProviderRunResult[]): number {
+  return results.filter((result) => result.status.status === "success").length;
+}
+
+async function fanOutProviders(
+  specs: ProviderJobSpec[],
+  timeoutMs = PROVIDER_TIMEOUT_MS,
+): Promise<ProviderRunResult[]> {
+  return Promise.all(
+    specs.map((spec) =>
+      runProvider(spec.name, spec.domain, spec.fn, spec.normalize, timeoutMs),
+    ),
+  );
+}
+
+type QuorumRetryOutcome = {
+  results: ProviderRunResult[];
+  retried: ProviderRunResult[];
+};
+
+async function maybeRetryFailedProvidersForQuorum(
+  results: ProviderRunResult[],
+  specs: ProviderJobSpec[],
+  requestId: string,
+): Promise<QuorumRetryOutcome> {
+  if (!isProviderQuorumRetryEnabled() || countSucceededProviders(results) >= QUORUM_REQUIRED) {
+    return { results, retried: [] };
+  }
+
+  const failedNames = new Set(
+    results.filter((result) => result.status.status !== "success").map((result) => result.name),
+  );
+  const retrySpecs = specs.filter((spec) => failedNames.has(spec.name));
+
+  if (retrySpecs.length === 0) {
+    return { results, retried: [] };
+  }
+
+  logProviderQuorumRetry(requestLogger(requestId, API_ROUTES.search), {
+    providersSucceeded: countSucceededProviders(results),
+    providersRequired: QUORUM_REQUIRED,
+    retryingProviders: retrySpecs.map((spec) => spec.name),
+    retryTimeoutMs: PROVIDER_RETRY_TIMEOUT_MS,
+  });
+
+  const retried = await fanOutProviders(retrySpecs, PROVIDER_RETRY_TIMEOUT_MS);
+  const byName = new Map(results.map((result) => [result.name, result]));
+  for (const result of retried) {
+    byName.set(result.name, result);
+  }
+
+  return {
+    results: specs.map((spec) => byName.get(spec.name)!),
+    retried,
+  };
 }
 
 function buildTripSummary(
@@ -224,25 +321,15 @@ async function finalizeTripSearch(
   requestId: string,
   started: number,
 ): Promise<TripSearchResult> {
-  const providers = toProviderFanOutPayload(parsedQuery);
+  const providerSpecs = buildProviderJobSpecs(toProviderFanOutPayload(parsedQuery));
+  const initialResults = await fanOutProviders(providerSpecs);
+  const { results } = await maybeRetryFailedProvidersForQuorum(
+    initialResults,
+    providerSpecs,
+    requestId,
+  );
 
-  const [sabreResult, amadeusResult, hotelbedsResult] = await Promise.all([
-    runProvider("sabre", "flights", () => searchSabreFlights(providers.sabre), normalizeSabreFlights),
-    runProvider("amadeus", "flights", () => searchAmadeusFlights(providers.amadeus), normalizeAmadeusFlights),
-    runProvider(
-      "hotelbeds",
-      "hotels",
-      () => searchHotelBedsHotels(providers.hotelbeds),
-      (raw) =>
-        normalizeHotelBedsHotels(raw, providers.hotelbeds.checkIn, providers.hotelbeds.checkOut),
-    ),
-  ]);
-
-  return assembleTripResponse(parsedQuery, requestId, started, [
-    sabreResult,
-    amadeusResult,
-    hotelbedsResult,
-  ]);
+  return assembleTripResponse(parsedQuery, requestId, started, results);
 }
 
 function pendingProviderStatus(name: ProviderName): ProviderStatus {
@@ -446,7 +533,7 @@ export async function* searchTripStream(
     return;
   }
 
-  const providers = toProviderFanOutPayload(parsedQuery);
+  const providerSpecs = buildProviderJobSpecs(toProviderFanOutPayload(parsedQuery));
 
   yield {
     type: "status",
@@ -454,43 +541,10 @@ export async function* searchTripStream(
     progress: 35,
   };
 
-  const providerJobs: Array<{
-    name: ProviderName;
-    promise: Promise<ProviderRunResult>;
-  }> = [
-    {
-      name: "sabre",
-      promise: runProvider(
-        "sabre",
-        "flights",
-        () => searchSabreFlights(providers.sabre),
-        normalizeSabreFlights,
-      ),
-    },
-    {
-      name: "amadeus",
-      promise: runProvider(
-        "amadeus",
-        "flights",
-        () => searchAmadeusFlights(providers.amadeus),
-        normalizeAmadeusFlights,
-      ),
-    },
-    {
-      name: "hotelbeds",
-      promise: runProvider(
-        "hotelbeds",
-        "hotels",
-        () => searchHotelBedsHotels(providers.hotelbeds),
-        (raw) =>
-          normalizeHotelBedsHotels(
-            raw,
-            providers.hotelbeds.checkIn,
-            providers.hotelbeds.checkOut,
-          ),
-      ),
-    },
-  ];
+  const providerJobs = providerSpecs.map((spec) => ({
+    name: spec.name,
+    promise: runProvider(spec.name, spec.domain, spec.fn, spec.normalize),
+  }));
 
   const pending = new Map(
     providerJobs.map(({ name, promise }) => [name, promise] as const),
@@ -545,7 +599,41 @@ export async function* searchTripStream(
     };
   }
 
-  const result = assembleTripResponse(parsedQuery, requestId, started, providerResults);
+  const { results: quorumResults, retried } = await maybeRetryFailedProvidersForQuorum(
+    providerResults,
+    providerSpecs,
+    requestId,
+  );
+
+  if (retried.length > 0) {
+    yield {
+      type: "status",
+      message: "Retrying unavailable providers...",
+      progress: 90,
+    };
+
+    for (const retryResult of retried) {
+      logProviderResult(requestLogger(requestId, API_ROUTES.searchStream), {
+        provider: retryResult.name,
+        status: retryResult.status.status,
+        offerCount: retryResult.status.offerCount,
+        durationMs: retryResult.status.durationMs,
+        error: retryResult.status.error,
+        attempt: 2,
+      });
+
+      yield {
+        type: "provider",
+        provider: retryResult.name,
+        status: retryResult.status,
+      };
+    }
+
+    const partial = buildTripSnapshot(parsedQuery, requestId, started, quorumResults, false);
+    yield { type: "offers_update", update: toClientOffersUpdate(partial) };
+  }
+
+  const result = assembleTripResponse(parsedQuery, requestId, started, quorumResults);
   await saveTripSearchCache(parsedQuery, result);
 
   const entry = (await lookupTripSearchCache(parsedQuery)).entry;

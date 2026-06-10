@@ -20,8 +20,8 @@ One deployable: Next.js standalone image serving both the landing/chat UI and AP
 ## Data flow
 
 1. **Traveler** submits a natural-language query in `app/chat/`.
-2. **API route** validates the body and calls `streamTripSearch()` (product UI) or `searchTrip()` (sync clients/tests).
-3. **Orchestrator** parses → cache check → parallel provider fan-out → normalize → rank → quorum.
+2. **API route** validates the body and calls `searchTripStream()` (product UI) or `searchTrip()` (sync clients/tests).
+3. **Orchestrator** parses → cache check → parallel provider fan-out → quorum retry (if needed) → normalize → rank → quorum check.
 4. **API route** returns ranked offers: SSE events (`provider`, `offers_update`, `complete`) on the stream path, or one JSON body on sync.
 5. **Chat UI** renders offers to the traveler as they arrive; `GET /api/trips/{id}` can hydrate history from the result store.
 
@@ -57,7 +57,7 @@ Modules talk through typed functions. Shared state lives in **Redis** (query cac
 | Function | Called by |
 |----------|-----------|
 | `searchTrip()` | `POST /api/trips/search` |
-| `streamTripSearch()` | `POST /api/trips/search/stream` |
+| `searchTripStream()` | `POST /api/trips/search/stream` |
 
 **Provider entry points**
 
@@ -73,11 +73,11 @@ All three go through `runProviderClient()`, which applies the circuit breaker an
 
 ## Sync vs stream
 
-Both paths share parse → cache → fan-out → normalize → rank → quorum.
+Both paths share parse → cache → fan-out → quorum retry (if needed) → normalize → rank → quorum check.
 
-**Sync** uses `Promise.all` on providers, then returns one JSON body. A global timeout wraps the whole thing.
+**Sync** uses `Promise.all` on providers, optionally retries failed providers once when quorum is missed, then returns one JSON body. A global timeout wraps the entire pipeline (parse + fan-out + retry).
 
-**Stream** uses a race loop: whichever provider finishes first emits SSE immediately. Partial offers reach the traveler through the chat UI while the slowest GDS is still working. No global timeout on the stream route; per-provider caps still apply.
+**Stream** uses a race loop: whichever provider finishes first emits SSE immediately. Partial offers reach the traveler through the chat UI while the slowest GDS is still working. If quorum is missed after all three settle, the orchestrator emits `"Retrying unavailable providers..."`, re-queries failed providers once, and streams additional `provider` + `offers_update` events. No global timeout on the stream route; per-provider caps apply on both attempts.
 
 ---
 

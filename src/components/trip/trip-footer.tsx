@@ -31,6 +31,31 @@ function formatPrice(amount: number): string {
   });
 }
 
+function ExpandToggle({
+  expanded,
+  onToggle,
+  compact,
+}: {
+  expanded: boolean;
+  onToggle: () => void;
+  compact?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-label={expanded ? "Collapse trip total" : "Expand trip breakdown"}
+      aria-expanded={expanded}
+      className={cn(
+        "flex items-center justify-center border border-gray-200 text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600",
+        compact ? "h-9 w-9 rounded-lg" : "h-10 w-10 rounded-xl",
+      )}
+    >
+      {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+    </button>
+  );
+}
+
 function BreakdownChip({
   icon: Icon,
   label,
@@ -82,6 +107,7 @@ export function TripFooter({
     budget !== undefined && total !== null ? roundMoney(budget - total) : null;
 
   const canBook = total !== null && withinBudget !== false;
+  const toggleExpanded = () => setExpanded((value) => !value);
 
   return (
     <div className="relative overflow-hidden rounded-2xl border border-gray-100 bg-white shadow-lg">
@@ -153,14 +179,7 @@ export function TripFooter({
             >
               Book Now
             </button>
-            <button
-              type="button"
-              onClick={() => setExpanded(false)}
-              aria-label="Collapse trip total"
-              className="flex h-10 w-10 items-center justify-center rounded-xl border border-gray-200 text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600"
-            >
-              <ChevronDown className="h-4 w-4" />
-            </button>
+            <ExpandToggle expanded={expanded} onToggle={toggleExpanded} />
           </div>
         </div>
       ) : (
@@ -189,15 +208,7 @@ export function TripFooter({
             >
               Book Now
             </button>
-            <button
-              type="button"
-              onClick={() => setExpanded(true)}
-              aria-label="Expand trip breakdown"
-              aria-expanded={false}
-              className="flex h-9 w-9 items-center justify-center rounded-lg border border-gray-200 text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600"
-            >
-              <ChevronUp className="h-4 w-4 rotate-180" />
-            </button>
+            <ExpandToggle expanded={expanded} onToggle={toggleExpanded} compact />
           </div>
         </div>
       )}

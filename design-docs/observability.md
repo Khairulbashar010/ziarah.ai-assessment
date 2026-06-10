@@ -12,7 +12,7 @@ How we observe trip search: logs, metrics, traces, and alerts — keyed on `requ
 | Log aggregation | **Loki** via **Promtail** (Docker Compose) |
 | Dashboards | **Grafana** — Trip Search Logs dashboard provisioned |
 | API error events | `validation_error`, `parse_error`, `quorum_failure`, `global_timeout`, `internal_error`, `trip_not_found` |
-| Orchestration events | `search_start`, `search_complete`, `provider_result`, `cache_refresh_failed`, `redis_error` |
+| Orchestration events | `search_start`, `search_complete`, `provider_result`, `provider_quorum_retry`, `cache_refresh_failed`, `redis_error` |
 | Health | `GET /api/health` — Redis ping, service name, timestamp, mock flags; 503 when Redis down |
 | Correlation | `X-Request-Id` on SSE responses (generate at ingress if missing) |
 | Duration | `X-Duration-Ms` on SSE responses |
@@ -48,6 +48,7 @@ trip.search
 │   ├── provider.sabre → normalize.sabre
 │   ├── provider.amadeus → normalize.amadeus
 │   └── provider.hotelbeds → normalize.hotelbeds
+├── provider.quorum_retry (optional — failed providers only, attempt 2)
 ├── rank + budget
 └── package.response
 ```
@@ -58,7 +59,8 @@ trip.search
 |------|------|
 | `trip.search` | `requestId`, `route`, `cache.status`, `quorum.met`, `durationMs` |
 | `llm.parse` | `model`, `mock`, `parse.source` (openai / regex / modify) |
-| `provider.*` | `provider.name`, `status`, `offerCount`, `durationMs`, `circuitBreaker.state` |
+| `provider.*` | `provider.name`, `status`, `offerCount`, `durationMs`, `attempt` (1 or 2), `circuitBreaker.state` |
+| `provider.quorum_retry` | `providersSucceeded`, `providersRequired`, `retryingProviders`, `retryTimeoutMs` |
 
 Runs on `@opentelemetry/sdk-node` with auto-instrumentation for `fetch` and incoming HTTP.
 
@@ -100,6 +102,20 @@ pino via `src/lib/observability/logger.ts`. Each API request gets a child logger
 
 ```json
 {
+  "level": "warn",
+  "timestamp": "2026-06-10T12:00:00.000Z",
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
+  "route": "/api/trips/search/stream",
+  "event": "provider_quorum_retry",
+  "providersSucceeded": 1,
+  "providersRequired": 2,
+  "retryingProviders": ["sabre", "amadeus"],
+  "retryTimeoutMs": 1000
+}
+```
+
+```json
+{
   "level": "error",
   "timestamp": "2026-06-10T12:00:00.000Z",
   "requestId": "550e8400-e29b-41d4-a716-446655440000",
@@ -107,7 +123,7 @@ pino via `src/lib/observability/logger.ts`. Each API request gets a child logger
   "event": "quorum_failure",
   "providersSucceeded": 1,
   "failedProviders": ["sabre", "amadeus"],
-  "durationMs": 2100,
+  "durationMs": 3100,
   "cacheStatus": "miss"
 }
 ```
@@ -116,8 +132,9 @@ pino via `src/lib/observability/logger.ts`. Each API request gets a child logger
 
 - Search start: `requestId`, route, query *length* (not content)
 - Parse done: `llm_parse_complete` (with `cachedPromptTokens`) or `llm_parse_fallback` (`reason`, `mode`)
-- Per provider: name, status, offer count, duration
-- Quorum failure: which providers failed
+- Per provider: name, status, offer count, duration (`attempt: 2` on quorum retry)
+- Quorum retry: `provider_quorum_retry` with `retryingProviders` and `retryTimeoutMs`
+- Quorum failure: which providers failed (after retry, if enabled)
 - Breaker open: provider, consecutive failure count
 
 **Don't log**

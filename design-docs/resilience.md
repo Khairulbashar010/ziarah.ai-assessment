@@ -6,7 +6,7 @@ Latency bounds, circuit breakers, quorum rules, and degradation paths when upstr
 
 ## Philosophy
 
-Trip search has a hard latency ceiling (~3s p95). Retrying a GDS call inside the same request usually makes things worse, not better. We fail fast per provider, aggregate what we got, and let the client or cache handle repeats.
+Trip search has a hard latency ceiling (~3s p95). We fail fast per provider on the first attempt, aggregate what we got, and only retry when quorum is at risk. Retries are **bounded**: one extra round, failed providers only, shorter timeout — not an open-ended retry loop. Client re-search and stale cache cover longer outages.
 
 ---
 
@@ -14,12 +14,13 @@ Trip search has a hard latency ceiling (~3s p95). Retrying a GDS call inside the
 
 | Layer | Default | Env var | Notes |
 |-------|---------|---------|-------|
-| Per-provider | 2500ms | `PROVIDER_TIMEOUT_MS` | Each GDS/HotelBeds call |
-| Global (sync only) | 3000ms prod | `GLOBAL_TIMEOUT_MS` | Wraps entire `searchTrip()` |
+| Per-provider (attempt 1) | 2500ms | `PROVIDER_TIMEOUT_MS` | Initial parallel fan-out |
+| Quorum retry (attempt 2) | 1000ms | `PROVIDER_RETRY_TIMEOUT_MS` | Failed providers only; skipped when quorum already met |
+| Global (sync only) | 3000ms prod | `GLOBAL_TIMEOUT_MS` | Wraps entire `searchTrip()` including one retry round |
 | LLM parse | 12000ms | `LLM_PARSE_TIMEOUT_MS` | `AbortController` on OpenAI |
-| Stream route | none (global) | — | Per-provider caps still apply |
+| Stream route | none (global) | — | Per-provider caps still apply on both attempts |
 
-Provider I/O eats most of the budget. The 2.5s per-provider cap means the slowest upstream can't block the fan-out past ~2.5s. Sync adds a 3s safety net; stream relies on partial SSE updates instead.
+Provider I/O eats most of the budget. The 2.5s per-provider cap means the slowest upstream can't block the initial fan-out past ~2.5s. A quorum retry adds up to `PROVIDER_RETRY_TIMEOUT_MS` per failed provider (parallel). Sync adds a 3s safety net that may return 504 before retry completes; stream relies on partial SSE updates and has no global cap.
 
 ---
 
@@ -37,13 +38,15 @@ When open, callers get `"Circuit breaker is open"` → `ProviderStatus.status: "
 
 ## Quorum
 
-Need ≥2 of 3 providers with `status: "success"`. Otherwise throw `QuorumError` → HTTP 503.
+Need ≥2 of 3 providers with `status: "success"` **after** the initial fan-out and any quorum retry. Otherwise throw `QuorumError` → HTTP 503.
 
-| Outcome | HTTP | `partialResults` |
-|---------|------|------------------|
+| Outcome (final) | HTTP | `partialResults` |
+|-----------------|------|------------------|
 | 3/3 | 200 | false |
 | 2/3 | 200 | true |
 | 0–1/3 | 503 | n/a |
+
+**When retry runs:** only when attempt 1 yields `<2` successes. Providers that succeeded on attempt 1 are not called again.
 
 **Practical combos**
 
@@ -57,7 +60,7 @@ HotelBeds is our only hotel source. If it's down and we don't have a stale cache
 
 ## Provider isolation
 
-Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses contained promises: one rejection never cancels siblings. The orchestrator always waits for all three to settle (success, error, or timeout) before quorum.
+Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses contained promises: one rejection never cancels siblings. The orchestrator always waits for all three to settle (success, error, or timeout) before evaluating quorum and deciding whether to retry.
 
 ---
 
@@ -65,10 +68,53 @@ Each provider runs in its own `try/catch` inside `runProvider()`. Fan-out uses c
 
 | Layer | Policy |
 |-------|--------|
-| GDS/HotelBeds | No automatic retry |
+| GDS/HotelBeds | One quorum retry — when fewer than 2 of 3 succeed, retry **only failed providers once** with `PROVIDER_RETRY_TIMEOUT_MS` (default 1000ms). Disable with `PROVIDER_QUORUM_RETRY=false`. |
 | LLM | Fallback chain, not retry: OpenAI → contextual modify → regex mock |
 | Client | User can retry the whole search |
 | Cache | Stale-while-revalidate refreshes in background; not a provider retry |
+
+### Quorum retry
+
+After the initial parallel fan-out, if quorum is not met (`<2` successes), the orchestrator retries each failed provider **once** with a shorter per-call timeout. Successful providers from the first attempt are kept; only failures are re-queried. There is **no third attempt** — one retry round per request, then success or `QuorumError`.
+
+```
+attempt 1 (parallel, PROVIDER_TIMEOUT_MS)
+    │
+    ├─ ≥2 successes → rank, return 200
+    │
+    └─ <2 successes
+           │
+           ├─ PROVIDER_QUORUM_RETRY=false → QuorumError (503)
+           │
+           └─ retry failed providers once (parallel, PROVIDER_RETRY_TIMEOUT_MS)
+                  │
+                  ├─ ≥2 successes → rank, return 200
+                  └─ still <2 → QuorumError (503)
+```
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `PROVIDER_QUORUM_RETRY` | `true` | Set `false` to fail fast on first quorum miss |
+| `PROVIDER_RETRY_TIMEOUT_MS` | `1000` | Per-provider cap on attempt 2 |
+
+**Max attempts per provider**
+
+| Scenario | Attempts |
+|----------|----------|
+| Succeeds on attempt 1 | 1 |
+| Fails attempt 1, quorum already met (2/3 OK) | 1 (not retried) |
+| Fails attempt 1, quorum missed, retry enabled | 2 |
+| Fails both attempts | 2 → contributes to 503 |
+
+**Examples**
+
+- Sabre + Amadeus fail transiently, HotelBeds OK (1/3) → retry Sabre + Amadeus → 3/3 if both recover.
+- Origin `ZZZ` (deterministic flight GDS failure) → retry Sabre + Amadeus → still fail → 503.
+- Sabre + HotelBeds OK, Amadeus down (2/3) → no retry; 200 with `partialResults: true`.
+
+Sync `POST /api/trips/search` may return **504** if the retry exhausts `GLOBAL_TIMEOUT_MS` (3s). Stream has no global cap — retries complete under per-provider limits and emit extra SSE `status` / `provider` / `offers_update` events.
+
+Logs emit `provider_quorum_retry` with the list of retried providers; retry results reuse `provider_result` with `attempt: 2`.
 
 ### LLM fallback chain
 

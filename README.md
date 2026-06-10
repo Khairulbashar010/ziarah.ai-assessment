@@ -6,6 +6,30 @@ Architecture, API contract, resilience model, and K8s notes: [`design-docs/`](de
 
 ---
 
+## UI walkthrough
+
+Natural-language trip search from landing page through streamed results. Example query used throughout:
+
+> family of 4 from Dubai to London, December 20-27, budget $3000
+
+**Landing** — quick-start chips and a single prompt to describe the whole trip.
+
+![Landing page — Meet Ziarah Travel AI](assets/screenshots/01-landing.png)
+
+**Planning** — the chat workspace streams progress as the orchestrator parses the query and fans out to providers. Processing steps update live while results load.
+
+![Planning your trip — processing steps and skeleton loaders](assets/screenshots/02-planning.png)
+
+**Flights** — ranked offers with route timeline, sort/filter controls, trip-level budget toggle, and a running total in the footer. Follow-up messages (e.g. "Let's make it 5k") refine the search in place.
+
+![Flight results — Dubai to London with budget-aware ranking](assets/screenshots/03-flights.png)
+
+**Hotels** — multi-stay planner, per-night pricing, and budget headroom after the selected flight. Pick hotels across the trip; the footer tracks combined flight + stay cost.
+
+![Hotel results — stay plan builder and multi-hotel selection](assets/screenshots/04-hotels.png)
+
+---
+
 ## How to run it
 
 ### Docker Compose (fastest path)
@@ -16,10 +40,23 @@ Mock mode by default — no provider keys, no OpenAI key, Redis included:
 docker compose up --build
 ```
 
-- App: [http://localhost:3000](http://localhost:3000)
-- Health: `GET /api/health` — expect `redis: "ok"`
-- Grafana: [http://localhost:3001](http://localhost:3001) — `admin` / `admin` (override via `GRAFANA_ADMIN_*` in `.env`)
-- Dashboard: **Trip Search → Trip Search Logs** — correlate via `X-Request-Id` from API responses
+### URLs (Docker Compose)
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| Trip search (UI) | [http://localhost:3000](http://localhost:3000) | Chat workspace — natural-language search |
+| Health | [http://localhost:3000/api/health](http://localhost:3000/api/health) | Expect `redis: "ok"` |
+| Trip search (sync) | `POST http://localhost:3000/api/trips/search` | JSON body `{ "query": "..." }` |
+| Trip search (stream) | `POST http://localhost:3000/api/trips/search/stream` | SSE — used by the chat UI |
+| Trip by ID | `GET http://localhost:3000/api/trips/{requestId}` | Cached result lookup |
+| Grafana | [http://localhost:3001](http://localhost:3001) | `admin` / `admin` — override via `GRAFANA_ADMIN_*` in `.env` |
+| Grafana dashboard | [http://localhost:3001/d/trip-search-logs/trip-search-logs](http://localhost:3001/d/trip-search-logs/trip-search-logs) | **Trip Search → Trip Search Logs** — filter by `requestId` |
+| Loki | [http://localhost:3100](http://localhost:3100) | Log backend (Grafana queries it; Promtail ships app stdout) |
+| Redis | `redis://localhost:6379` | Query cache, result store, refresh locks |
+
+Port overrides: `HOST_PORT`, `GRAFANA_HOST_PORT`, `LOKI_HOST_PORT`, `REDIS_HOST_PORT` in `.env` (see `.env.example`).
+
+Correlate requests using `X-Request-Id` from API responses → paste into the Grafana dashboard variable.
 
 ### Local development
 
@@ -42,6 +79,14 @@ npm run build && npm run start     # production binary locally
 ```
 
 `.env` defaults to `MOCK_PROVIDERS=true` and `MOCK_LLM=true`. All tunables are documented in `.env.example`.
+
+| Service | URL |
+|---------|-----|
+| Trip search (UI + API) | [http://localhost:3000](http://localhost:3000) |
+| Health | [http://localhost:3000/api/health](http://localhost:3000/api/health) |
+| Redis | `redis://localhost:6379` |
+
+Grafana and Loki are not started in local-only mode — use Docker Compose for the full observability stack.
 
 ### Verify it works
 
@@ -98,7 +143,7 @@ See [load/README.md](load/README.md) for tuning and K8s-scale runs.
 
 **2-of-3 quorum.** Two flight GDSs give us redundancy on the air side. Hotels come from HotelBeds only — if it's down and we don't have a stale cache entry with hotel inventory, we 503 even when both Sabre and Amadeus are fine. That's intentional: returning flights with no hotels is a worse UX than a clear error.
 
-**No retries on provider calls.** A retry inside the same request usually blows the 3s ceiling. Per-provider timeout (2.5s), circuit breaker (3 failures → 30s open), and client/cache retry are the recovery story. Predictable failure beats heroic recovery.
+**One quorum retry on provider calls.** If fewer than 2 of 3 succeed on the first fan-out, only the failed providers are retried once (1s cap by default). Still bounded by the 3s sync global timeout. Circuit breaker (3 failures → 30s open) and client/cache retry cover longer outages.
 
 **SSE-first, sync second.** The chat UI streams `provider` and `offers_update` events so users see results land instead of waiting on the slowest GDS. Sync route exists for tests and simple clients; it wraps the same pipeline with a global timeout.
 

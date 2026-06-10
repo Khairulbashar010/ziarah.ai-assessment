@@ -9,7 +9,7 @@ Start with **system-design.md**. The other files go deeper on one topic each —
 | [system-design.md](./system-design.md) | End-to-end design — architecture, API, failure handling, deployment |
 | [architecture.md](./architecture.md) | Code layout, data flow, caching, service boundary |
 | [api-contract.md](./api-contract.md) | Request/response shapes, SSE events, error codes |
-| [resilience.md](./resilience.md) | Timeouts, circuit breakers, quorum, degradation |
+| [resilience.md](./resilience.md) | Timeouts, circuit breakers, quorum, one-shot retry, degradation |
 | [observability.md](./observability.md) | Logs, metrics, traces, alerts — pino, Loki, Prometheus, OTEL |
 | [kubernetes.md](./kubernetes.md) | Production topology, HPA, manifests, Redis |
 

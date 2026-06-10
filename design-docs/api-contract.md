@@ -45,8 +45,8 @@ X-Request-Id: 550e8400-e29b-41d4-a716-446655440000
 |--------|-------|--------------|
 | 400 | Zod validation | `{ "error": "Please check your search and try again." }` |
 | 422 | Parse failure | `{ "error": "We couldn't understand that trip request." }` |
-| 503 | Quorum failure | `{ "error": "Search providers are temporarily unavailable." }` |
-| 504 | Global timeout | `{ "error": "Your search took too long. Please try again." }` |
+| 503 | Quorum failure (after quorum retry, if enabled) | `{ "error": "Search providers are temporarily unavailable." }` |
+| 504 | Global timeout (sync only; may occur during retry) | `{ "error": "Your search took too long. Please try again." }` |
 | 500 | Unhandled | `{ "error": "Something went wrong. Please try again." }` |
 
 User-facing strings come from `src/lib/user-messages.ts`. Internals stay in server logs.
@@ -55,7 +55,7 @@ User-facing strings come from `src/lib/user-messages.ts`. Internals stay in serv
 
 ## `POST /api/trips/search/stream`
 
-Same request body. No global timeout; providers still capped at `PROVIDER_TIMEOUT_MS`.
+Same request body. No global timeout; providers capped at `PROVIDER_TIMEOUT_MS` on attempt 1 and `PROVIDER_RETRY_TIMEOUT_MS` on attempt 2 (quorum retry). Disable retry with `PROVIDER_QUORUM_RETRY=false`.
 
 ### Response headers
 
@@ -92,8 +92,16 @@ data: {"type":"provider","provider":"sabre","status":{"domain":"flights","status
 
 data: {"type":"offers_update","update":{"meta":{...},"flights":{...},"hotels":{...},"tripSummary":{...}}}
 
+data: {"type":"status","message":"Retrying unavailable providers...","progress":90}
+
+data: {"type":"provider","provider":"amadeus","status":{"domain":"flights","status":"success","offerCount":18,"durationMs":620}}
+
+data: {"type":"offers_update","update":{"meta":{...},"flights":{...},"hotels":{...},"tripSummary":{...}}}
+
 data: {"type":"complete","result":{...}}
 ```
+
+The `Retrying unavailable providers...` status and second-round `provider` events appear only when attempt 1 misses quorum and `PROVIDER_QUORUM_RETRY` is enabled. Clients should treat duplicate `provider` events for the same name as a status update (attempt 2 replaces attempt 1 in the final result).
 
 Validation errors before the stream opens return `400` JSON, not SSE.
 

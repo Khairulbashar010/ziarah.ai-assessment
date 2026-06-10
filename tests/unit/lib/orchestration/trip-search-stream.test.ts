@@ -85,6 +85,45 @@ describe("searchTripStream", () => {
     expect(error).toBeInstanceOf(QuorumError);
   });
 
+  it("streams retry provider events when quorum retry recovers", async () => {
+    const sabreClient = await import("@/lib/providers/sabre/client");
+    const amadeusClient = await import("@/lib/providers/amadeus/client");
+    const { buildSabreOtaResponse } = await import("@/mocks/handlers/sabre-ota-bfm");
+    const { buildAmadeusFlightOffersResponse } = await import("@/mocks/handlers/amadeus-flights");
+    const sabreCalls = { count: 0 };
+    const amadeusCalls = { count: 0 };
+
+    const sabreSpy = vi.spyOn(sabreClient, "searchSabreFlights").mockImplementation(async (params) => {
+      sabreCalls.count += 1;
+      if (sabreCalls.count === 1) {
+        throw new Error("Sabre transient");
+      }
+      return buildSabreOtaResponse(params);
+    });
+    const amadeusSpy = vi
+      .spyOn(amadeusClient, "searchAmadeusFlights")
+      .mockImplementation(async (params) => {
+        amadeusCalls.count += 1;
+        if (amadeusCalls.count === 1) {
+          throw new Error("Amadeus transient");
+        }
+        return buildAmadeusFlightOffersResponse(params);
+      });
+
+    const events = await collectStreamEvents(QUERY, "retry-req");
+
+    expect(sabreCalls.count).toBe(2);
+    expect(amadeusCalls.count).toBe(2);
+    expect(events.some((e) => e.type === "status" && e.message.includes("Retrying unavailable"))).toBe(
+      true,
+    );
+    expect(events.filter((e) => e.type === "provider").length).toBe(5);
+    expect(events.at(-1)?.type).toBe("complete");
+
+    sabreSpy.mockRestore();
+    amadeusSpy.mockRestore();
+  });
+
   it("skips refresh update when background refresh fails for stale cache", async () => {
     const first = await searchTrip(QUERY, "stale-fail-seed");
     await saveTripSearchCache(first.parsedQuery, first, Date.now() - 25 * 60 * 1000);

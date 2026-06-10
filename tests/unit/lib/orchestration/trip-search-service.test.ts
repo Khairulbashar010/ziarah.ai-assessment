@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { clearTripSearchCache } from "@/lib/storage/trip-query-cache";
 import { searchTrip, QuorumError } from "@/lib/orchestration/trip-search-service";
+import { buildSabreOtaResponse } from "@/mocks/handlers/sabre-ota-bfm";
+import { buildAmadeusFlightOffersResponse } from "@/mocks/handlers/amadeus-flights";
 
 describe("trip search orchestrator", () => {
   beforeEach(async () => {
@@ -40,6 +42,80 @@ describe("trip search orchestrator", () => {
       expect(error.details.providers.sabre.status).not.toBe("success");
       expect(error.details.route).toBe("ZZZ → LON");
     }
+  });
+
+  it("retries failed providers once and recovers quorum when retry succeeds", async () => {
+    const sabreClient = await import("@/lib/providers/sabre/client");
+    const amadeusClient = await import("@/lib/providers/amadeus/client");
+    const sabreCalls = { count: 0 };
+    const amadeusCalls = { count: 0 };
+
+    const sabreSpy = vi.spyOn(sabreClient, "searchSabreFlights").mockImplementation(async (params) => {
+      sabreCalls.count += 1;
+      if (sabreCalls.count === 1) {
+        throw new Error("Sabre transient");
+      }
+      return buildSabreOtaResponse(params);
+    });
+    const amadeusSpy = vi
+      .spyOn(amadeusClient, "searchAmadeusFlights")
+      .mockImplementation(async (params) => {
+        amadeusCalls.count += 1;
+        if (amadeusCalls.count === 1) {
+          throw new Error("Amadeus transient");
+        }
+        return buildAmadeusFlightOffersResponse(params);
+      });
+
+    const result = await searchTrip(
+      "family of 4 from Dubai to London, December 20-27, budget $3000",
+    );
+
+    expect(sabreCalls.count).toBe(2);
+    expect(amadeusCalls.count).toBe(2);
+    expect(result.meta.providersSucceeded).toBe(3);
+    expect(result.flights.offers.length).toBeGreaterThan(0);
+    expect(result.hotels.offers.length).toBeGreaterThan(0);
+
+    sabreSpy.mockRestore();
+    amadeusSpy.mockRestore();
+  });
+
+  it("skips quorum retry when PROVIDER_QUORUM_RETRY=false", async () => {
+    vi.stubEnv("PROVIDER_QUORUM_RETRY", "false");
+
+    const sabreClient = await import("@/lib/providers/sabre/client");
+    const amadeusClient = await import("@/lib/providers/amadeus/client");
+    const sabreCalls = { count: 0 };
+    const amadeusCalls = { count: 0 };
+
+    const sabreSpy = vi.spyOn(sabreClient, "searchSabreFlights").mockImplementation(async (params) => {
+      sabreCalls.count += 1;
+      if (sabreCalls.count === 1) {
+        throw new Error("Sabre transient");
+      }
+      return buildSabreOtaResponse(params);
+    });
+    const amadeusSpy = vi
+      .spyOn(amadeusClient, "searchAmadeusFlights")
+      .mockImplementation(async (params) => {
+        amadeusCalls.count += 1;
+        if (amadeusCalls.count === 1) {
+          throw new Error("Amadeus transient");
+        }
+        return buildAmadeusFlightOffersResponse(params);
+      });
+
+    const error = await searchTrip(
+      "family of 4 from Dubai to London, December 20-27, budget $3000",
+    ).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(QuorumError);
+    expect(sabreCalls.count).toBe(1);
+    expect(amadeusCalls.count).toBe(1);
+
+    sabreSpy.mockRestore();
+    amadeusSpy.mockRestore();
   });
 
   it("only returns offers that can form a trip within the customer budget", async () => {

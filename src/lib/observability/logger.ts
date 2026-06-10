@@ -96,10 +96,26 @@ export function logProviderResult(
     offerCount: number;
     durationMs: number;
     error?: string;
+    attempt?: number;
   },
 ): void {
   const level = details.status === "success" ? "info" : "warn";
   log[level]({ event: "provider_result", ...details }, `provider ${details.provider} ${details.status}`);
+}
+
+export function logProviderQuorumRetry(
+  log: Logger,
+  details: {
+    providersSucceeded: number;
+    providersRequired: number;
+    retryingProviders: string[];
+    retryTimeoutMs: number;
+  },
+): void {
+  log.warn(
+    { event: "provider_quorum_retry", ...details },
+    "quorum not met — retrying failed providers once",
+  );
 }
 
 export function logLlmParseComplete(
