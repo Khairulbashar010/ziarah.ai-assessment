@@ -1,0 +1,56 @@
+[
+  {
+    "code": 8812,
+    "name": "London City Inn",
+    "destinationCode": "LON",
+    "category": "4 STARS",
+    "lat": 51.507,
+    "lng": -0.128,
+    "pricePerNight": 178
+  },
+  {
+    "code": 8813,
+    "name": "London Budget Stay",
+    "destinationCode": "LON",
+    "category": "3 STARS",
+    "lat": 51.512,
+    "lng": -0.105,
+    "pricePerNight": 95
+  },
+  {
+    "code": 3424,
+    "name": "As Americas",
+    "destinationCode": "PMI",
+    "category": "4 STARS",
+    "lat": 39.571,
+    "lng": 2.647,
+    "pricePerNight": 127
+  },
+  {
+    "code": 10245,
+    "name": "The Grand Dubai",
+    "destinationCode": "DXB",
+    "category": "5 STARS",
+    "lat": 25.204,
+    "lng": 55.271,
+    "pricePerNight": 245
+  },
+  {
+    "code": 5501,
+    "name": "Bangkok Riverside",
+    "destinationCode": "BKK",
+    "category": "4 STARS",
+    "lat": 13.724,
+    "lng": 100.493,
+    "pricePerNight": 95
+  },
+  {
+    "code": 264,
+    "name": "Palma Bay Resort",
+    "destinationCode": "PMI",
+    "category": "5 STARS",
+    "lat": 39.552,
+    "lng": 2.624,
+    "pricePerNight": 210
+  }
+]

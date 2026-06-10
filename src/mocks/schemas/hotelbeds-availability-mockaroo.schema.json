@@ -1,0 +1,44 @@
+[
+  {
+    "name": "nightlyNet",
+    "type": "Number",
+    "min": 65,
+    "max": 380,
+    "decimals": 2
+  },
+  {
+    "name": "taxPerNight",
+    "type": "Number",
+    "min": 6,
+    "max": 48,
+    "decimals": 2
+  },
+  {
+    "name": "allotment",
+    "type": "Number",
+    "min": 2,
+    "max": 15
+  },
+  {
+    "name": "exclusiveDeal",
+    "type": "Number",
+    "min": 0,
+    "max": 3
+  },
+  {
+    "name": "boardCode",
+    "type": "Custom List",
+    "values": ["BB", "RO", "HB"]
+  },
+  {
+    "name": "rateType",
+    "type": "Custom List",
+    "values": ["BOOKABLE", "RECHECK"]
+  },
+  {
+    "name": "zoneCode",
+    "type": "Number",
+    "min": 10,
+    "max": 99
+  }
+]

@@ -1,36 +1,123 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Ziarah Trip Search Service
 
-## Getting Started
+Engineering assessment submission for [Ziarah.ai](https://ziarah.ai) — a conversational trip search service that aggregates **Sabre** and **Amadeus** flights with **HotelBeds** hotels from a single natural-language query.
 
-First, run the development server:
+## Airport data
+
+`src/data/airports-index.json` — compact airport lookup (IATA codes, coordinates, cities, countries). Used for city resolution and route display.
+
+## Quick start
 
 ```bash
+npm install
+cp .env.example .env
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) and try:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+> family of 4 from Dubai to London, December 20-27, budget $3000
 
-## Learn More
+## Docker
 
-To learn more about Next.js, take a look at the following resources:
+Configure variables in `.env` (see `.env.example`), then:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+docker compose up --build
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Docker Compose loads all settings from `.env` — nothing is hardcoded in the image.
 
-## Deploy on Vercel
+## API
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### `POST /api/trips/search`
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+curl -X POST http://localhost:3000/api/trips/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"family of 4 from Dubai to London, December 20-27, budget $3000"}'
+```
+
+Returns unified `flights`, `hotels`, and `tripSummary` with 2-of-3 provider quorum.
+
+### `GET /api/health`
+
+Health check with mock mode flags.
+
+## Architecture
+
+```
+NL query → LLM parser → parallel provider fan-out (3) → normalize → trip response
+                         ├── Sabre (flights)
+                         ├── Amadeus (flights)
+                         └── HotelBeds (hotels)
+```
+
+- **Quorum:** ≥2 of 3 providers must succeed for HTTP 200
+- **Resilience:** Per-provider timeouts (2.5s), circuit breakers, partial results
+- **Mocks:** Provider-native JSON shapes per `docs/mock-api-specification.md`
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the full system design.
+
+## Tests
+
+```bash
+npm test
+```
+
+Covers normalization (Sabre, Amadeus, HotelBeds), quorum success/failure, and budget math.
+
+## Project structure
+
+```
+src/
+├── app/                    # Next.js pages + API routes (thin handlers)
+├── components/
+│   ├── chat/               # Conversational search UI
+│   ├── flights/            # Flight results + flight-card
+│   ├── hotels/             # Hotel results + hotel-card
+│   ├── trip/               # Trip workspace (results panel, footer, timeline)
+│   ├── landing/            # Hero + quick chips
+│   ├── layout/             # Sidebar, top bar
+│   └── ui/                 # Shared primitives
+├── lib/
+│   ├── api/                # Shared API request schemas
+│   ├── client/             # Browser-side fetch, filters, budget math
+│   ├── orchestration/      # Trip search orchestrator (fan-out, quorum)
+│   ├── trip-search/        # Response shaping, ranking, SSE events
+│   ├── storage/            # In-memory cache + result store
+│   ├── llm/                # NL query parser + chat intent
+│   ├── providers/          # Sabre, Amadeus, HotelBeds adapters
+│   ├── normalization/      # Provider JSON → unified offers
+│   ├── geo/                # Airport index, routing helpers
+│   └── resilience/         # Timeouts, circuit breakers
+├── mocks/                  # Deterministic provider mocks + seeds
+└── data/                   # Static airport index
+```
+
+See [`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md) for enterprise OTA comparison and refactor roadmap.
+
+## Trade-offs
+
+| Decision | Rationale |
+|----------|-----------|
+| Modular monolith (Next.js) | Sufficient for 10k concurrent users via horizontal pod scaling |
+| HotelBeds for hotels, not flights | Matches Ziarah's product and real provider capabilities |
+| `MOCK_LLM=true` by default | Deterministic CI/Docker without OpenAI key; set `MOCK_LLM=false` + `OPENAI_API_KEY` for free-form NL |
+| In-memory trip cache | Demo simplicity; production would use Redis |
+
+## With more time
+
+- Real OAuth integrations for Sabre/Amadeus/HotelBeds
+- Redis session store + chat history
+- Activity & transfer providers
+- Booking flow with HotelBeds CheckRate + Sabre revalidate
+- OpenTelemetry tracing across provider fan-out
+- Rate limiting and API key auth
+
+## Documentation
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) — System design (deliverable)
+- [`docs/ASSESSMENT-PLAN.md`](docs/ASSESSMENT-PLAN.md) — Implementation plan
+- [`docs/mock-api-specification.md`](docs/mock-api-specification.md) — Provider mock spec

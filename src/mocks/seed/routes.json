@@ -1,0 +1,64 @@
+{
+  "DXB-LON": {
+    "origin": "DXB",
+    "destination": "LON",
+    "airlines": ["EK", "BA", "QR"],
+    "direct": true,
+    "priceMin": 650,
+    "priceMax": 3200,
+    "durationMinutes": 480,
+    "offers": [
+      {
+        "carrier": "EK",
+        "flightNumber": "29",
+        "origin": "DXB",
+        "destination": "LHR",
+        "departure": "08:30",
+        "arrival": "12:45",
+        "stops": 0,
+        "priceMultiplier": 1.0
+      },
+      {
+        "carrier": "BA",
+        "flightNumber": "112",
+        "origin": "DXB",
+        "destination": "LHR",
+        "departure": "14:15",
+        "arrival": "18:30",
+        "stops": 0,
+        "priceMultiplier": 0.93
+      },
+      {
+        "carrier": "QR",
+        "flightNumber": "1015",
+        "origin": "DXB",
+        "destination": "LHR",
+        "departure": "02:10",
+        "arrival": "11:55",
+        "stops": 1,
+        "priceMultiplier": 0.78
+      }
+    ]
+  },
+  "JFK-LHR": {
+    "origin": "JFK",
+    "destination": "LHR",
+    "airlines": ["BA", "VS", "AA"],
+    "direct": true,
+    "priceMin": 450,
+    "priceMax": 1200,
+    "durationMinutes": 420,
+    "offers": [
+      {
+        "carrier": "BA",
+        "flightNumber": "178",
+        "origin": "JFK",
+        "destination": "LHR",
+        "departure": "19:00",
+        "arrival": "07:15",
+        "stops": 0,
+        "priceMultiplier": 1.0
+      }
+    ]
+  }
+}

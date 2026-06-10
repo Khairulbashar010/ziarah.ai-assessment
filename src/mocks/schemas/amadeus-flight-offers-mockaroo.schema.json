@@ -1,0 +1,56 @@
+[
+  {
+    "name": "carrier",
+    "type": "Custom List",
+    "values": ["EK", "BA", "QR", "TG", "AF", "LH", "SQ"]
+  },
+  {
+    "name": "flightNumber",
+    "type": "Number",
+    "min": 100,
+    "max": 9999
+  },
+  {
+    "name": "baseFarePerPax",
+    "type": "Number",
+    "min": 280,
+    "max": 1200,
+    "decimals": 2
+  },
+  {
+    "name": "taxPerPax",
+    "type": "Number",
+    "min": 55,
+    "max": 220,
+    "decimals": 2
+  },
+  {
+    "name": "outboundElapsed",
+    "type": "Number",
+    "min": 300,
+    "max": 720
+  },
+  {
+    "name": "returnElapsed",
+    "type": "Number",
+    "min": 300,
+    "max": 720
+  },
+  {
+    "name": "stops",
+    "type": "Number",
+    "min": 0,
+    "max": 1
+  },
+  {
+    "name": "equipment",
+    "type": "Custom List",
+    "values": ["77W", "359", "789", "333", "320"]
+  },
+  {
+    "name": "bookableSeats",
+    "type": "Number",
+    "min": 2,
+    "max": 9
+  }
+]
