@@ -86,7 +86,7 @@ npm run dev                        # development
 npm run build && npm run start     # production binary locally
 ```
 
-`.env` defaults to `MOCK_PROVIDERS=true` and `MOCK_LLM=true`. All tunables are documented in `.env.example`.
+Copy `.env.example` → `.env` and adjust mock flags (see [Mock and live configuration](#mock-and-live-configuration) below). Docker Compose defaults to all-mock providers with no keys required.
 
 | Service | URL |
 |---------|-----|
@@ -133,15 +133,88 @@ npm run loadtest:docker:capacity
 
 See [load/README.md](load/README.md) for tuning and K8s-scale runs.
 
-### Operating modes
+### Mock and live configuration
 
-| Mode | Config | When to use |
-|------|--------|-------------|
-| Mock everything | `MOCK_PROVIDERS=true`, `MOCK_LLM=true` | CI, Docker demo, local dev without credentials |
-| Live flights + hotels | `MOCK_PROVIDERS=false`, Sabre + HotelBeds keys in `.env` | Sandbox integration testing |
-| Live LLM | `MOCK_LLM=false`, `OPENAI_API_KEY` set | Free-form queries the regex parser won't catch |
+All toggles live in `.env` (copy from `.env.example`). Restart the app after changing them.
 
-**What's live today:** Sabre BFM and HotelBeds availability can hit real sandboxes. Amadeus is mock-only in this assessment — enterprise onboarding is slow and Sabre already proves the GDS integration path. The Amadeus adapter slot exists; set `MOCK_AMADEUS=false` when credentials are available.
+**Check what's active:** `GET /api/health` returns `mockProviders`, `providerMocks` (per provider), and `mockLlm`.
+
+```bash
+curl -s http://localhost:3000/api/health | jq '{mockProviders, providerMocks, mockLlm}'
+```
+
+#### Provider mocks
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MOCK_PROVIDERS` | `true` | Master switch. `false` = call real APIs (credentials required). |
+| `MOCK_SABRE` | *(inherits)* | Override Sabre only — `true` = mock, `false` = live sandbox. |
+| `MOCK_AMADEUS` | *(inherits)* | Override Amadeus only. |
+| `MOCK_HOTELBEDS` | *(inherits)* | Override HotelBeds only. |
+
+Per-provider vars override the master switch. Unset = follow `MOCK_PROVIDERS`.
+
+**Credentials needed when live** (`MOCK_*=false`):
+
+| Provider | Env vars |
+|----------|----------|
+| Sabre | `SABRE_CLIENT_ID`, `SABRE_CLIENT_SECRET`, `SABRE_PCC` |
+| Amadeus | `AMADEUS_CLIENT_ID`, `AMADEUS_CLIENT_SECRET` |
+| HotelBeds | `HOTELBEDS_API_KEY`, `HOTELBEDS_API_SECRET` |
+
+#### LLM mock
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MOCK_LLM` | `false` in `.env.example` | `true` = regex parser only — no OpenAI calls (CI, load tests). |
+| `OPENAI_API_KEY` | empty | When set and `MOCK_LLM` is not `true`, OpenAI parses free-form queries first; regex is the fallback. |
+
+Without a key, parsing always falls back to regex regardless of `MOCK_LLM`.
+
+#### Common setups
+
+**All mock (Docker demo, no keys needed):**
+
+```env
+MOCK_PROVIDERS=true
+MOCK_LLM=true
+```
+
+**Live Sabre + HotelBeds, mock Amadeus:**
+
+```env
+MOCK_PROVIDERS=false
+MOCK_AMADEUS=true
+SABRE_CLIENT_ID=...
+SABRE_CLIENT_SECRET=...
+SABRE_PCC=...
+HOTELBEDS_API_KEY=...
+HOTELBEDS_API_SECRET=...
+```
+
+**Live providers + live LLM:**
+
+```env
+MOCK_PROVIDERS=false
+MOCK_LLM=false
+OPENAI_API_KEY=sk-...
+# plus provider credentials above
+```
+
+Docker Compose defaults to `MOCK_PROVIDERS=true`. LLM mode comes from your `.env` file (`env_file` in `docker-compose.yml`).
+
+#### Mock chaos (testing only)
+
+Only apply when providers are mocked:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MOCK_LATENCY_MS_MIN` / `MAX` | 200 / 800 | Artificial delay per provider call |
+| `MOCK_FAILURE_RATE` | 0 | Random failure probability (0–1) |
+
+Deterministic failure triggers (origin `ZZZ`, `destinationCode` `FAIL`, etc.) are documented in [resilience.md](design-docs/resilience.md).
+
+**What's live today:** Sabre BFM and HotelBeds availability can hit real sandboxes. Amadeus live code exists but needs credentials — set `MOCK_AMADEUS=false` when available.
 
 ---
 
