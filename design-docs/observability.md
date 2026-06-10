@@ -11,23 +11,22 @@ How we observe trip search — keyed on `requestId` end to end.
 | Structured logs | **pino** (`src/lib/observability/logger.ts`) | JSON to stdout; each request gets `requestId` + `route` |
 | Log aggregation | **Promtail → Loki → Grafana** (Docker Compose) | `docker compose up` → Grafana on `:3001` |
 | Dashboards | **Grafana** — Trip Search Logs | Filter by `requestId`, event type, provider |
-| Health | `GET /api/health` | Redis ping; 503 when Redis down |
+| Metrics | **Prometheus** + `GET /api/metrics` | `prom-client` histograms/counters/gauges; scraped every 15s |
+| Tracing | **OpenTelemetry** (`src/lib/observability/tracing.ts`) | Span tree rooted at `trip.search`; W3C `traceparent` at ingress |
+| Alerts | **Prometheus rules** + **Grafana unified alerting** | `observability/prometheus/alerts.yml` + Grafana provisioning |
+| Health | `GET /api/health` | Redis ping; 503 when Redis down; sets `redis_connection_up` gauge |
 | Correlation | `X-Request-Id` header | Copy from API response → paste into Grafana |
 | Duration | `X-Duration-Ms` header | Total search time on SSE responses |
 
-**Compose stack:** app stdout → Promtail (Docker socket) → Loki → Grafana. Config lives under `observability/`. Run `docker compose up` to get the full log pipeline locally.
+**Compose stack:** app → Promtail → Loki → Grafana; Prometheus scrapes `/api/metrics`. Config lives under `observability/`. Run `docker compose up` for the full observability stack locally.
 
-**Not implemented yet:** Prometheus `/api/metrics`, OpenTelemetry tracing, Grafana alert rules. Those are documented below as the production roadmap.
+**Env toggles:** `METRICS_ENABLED` (default `true`), `OTEL_ENABLED` (default `true`), `OTEL_TRACES_EXPORTER=console` (Docker default), `OTEL_EXPORTER_OTLP_ENDPOINT` for OTLP export.
 
 ---
 
-## Production roadmap
+## Metrics
 
-These are design targets for a production deployment — not running in this repo today.
-
-### Metrics (planned)
-
-Prometheus would scrape `/api/metrics` for SLO tracking.
+Prometheus scrapes `/api/metrics` for SLO tracking (`src/lib/observability/metrics.ts`).
 
 **Histograms**
 
@@ -53,9 +52,9 @@ Prometheus would scrape `/api/metrics` for SLO tracking.
 | `circuit_breaker_state` | `provider` | 0=closed, 1=open, 2=half-open |
 | `http_inflight_requests` | — | HPA custom metric (see [kubernetes.md](./kubernetes.md)) |
 
-### Tracing (planned)
+### Tracing
 
-OpenTelemetry span tree on `@opentelemetry/sdk-node`:
+OpenTelemetry span tree on `@opentelemetry/sdk-trace-node` (initialized in `src/instrumentation.ts`):
 
 ```
 trip.search
@@ -70,9 +69,9 @@ trip.search
 └── package.response
 ```
 
-W3C `traceparent` would propagate at the ingress boundary. In K8s, Fluent Bit replaces Promtail and Tempo/X-Ray replaces the local collector — same signal paths.
+W3C `traceparent` propagates at the ingress boundary (`extractTraceContext` in API routes). In K8s, Fluent Bit replaces Promtail and Tempo/X-Ray replaces the local OTLP collector — same signal paths.
 
-### Alerts (planned)
+### Alerts
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|

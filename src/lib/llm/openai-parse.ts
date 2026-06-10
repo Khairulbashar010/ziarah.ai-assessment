@@ -2,6 +2,7 @@ import { buildContextualUserMessage, TRIP_PARSE_SYSTEM_PROMPT } from "./parse-in
 import { tripSearchParamsSchema } from "./schemas";
 import type { TripSearchParams } from "@/lib/types/trip";
 import { rootLogger, logLlmParseComplete } from "@/lib/observability/logger";
+import { recordLlmParse } from "@/lib/observability/metrics";
 
 type OpenAIChatUsage = {
   prompt_tokens?: number;
@@ -304,14 +305,16 @@ export async function parseTripQueryWithOpenAI(
     const content = data.choices[0]?.message?.content;
     if (!content) throw new Error("Empty LLM response");
 
+    const durationMs = Date.now() - started;
     logLlmParseComplete(rootLogger, {
-      durationMs: Date.now() - started,
+      durationMs,
       timeoutMs,
       mode,
       promptTokens: data.usage?.prompt_tokens,
       completionTokens: data.usage?.completion_tokens,
       cachedPromptTokens: data.usage?.prompt_tokens_details?.cached_tokens,
     });
+    recordLlmParse({ source: "openai", durationMs });
 
     return normalizeOpenAIParsedParams(JSON.parse(content));
   } catch (error) {

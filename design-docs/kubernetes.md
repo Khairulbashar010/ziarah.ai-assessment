@@ -60,7 +60,7 @@ Search is **I/O-bound** (waiting on Sabre/Amadeus/HotelBeds), not CPU-bound. CPU
 
 **Caveats:** Per-pod throughput is also bounded by memory (offer payload size), outbound connection pools, upstream latency, and provider rate limits — often before Kubernetes runs out of pods. Run `load/capacity.js` on hardware matching prod to validate the ~100/pod assumption.
 
-The `http_inflight_requests` HPA metric in the example below is a **planned** custom metric — not implemented in the app yet. See [observability.md](./observability.md).
+The `http_inflight_requests` gauge is exported on `GET /api/metrics` and incremented per active search request. See [observability.md](./observability.md).
 
 ---
 

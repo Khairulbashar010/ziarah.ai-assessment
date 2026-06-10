@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 1m
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: trip-search
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ["trip-search:3000"]

@@ -28,7 +28,7 @@ You do **not** need to read every file cover to cover.
 | [architecture.md](./architecture.md) | Code layout, data flow, caching, service boundary |
 | [api-contract.md](./api-contract.md) | Request/response shapes, SSE events, error codes |
 | [resilience.md](./resilience.md) | Timeouts, circuit breakers, quorum, one-shot retry |
-| [observability.md](./observability.md) | What's implemented today (logs) + production roadmap (metrics, traces) |
+| [observability.md](./observability.md) | Logs, Prometheus metrics, OpenTelemetry traces, and alert rules |
 | [kubernetes.md](./kubernetes.md) | Production topology, HPA, example manifests, Redis |
 
 Runnable setup, load tests, and the Docker Compose log stack: [README](../README.md) and [load/README.md](../load/README.md).

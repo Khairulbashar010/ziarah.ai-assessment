@@ -12,6 +12,13 @@ import {
   logSearchStart,
   requestLogger,
 } from "@/lib/observability/logger";
+import {
+  decrementInflightRequests,
+  incrementInflightRequests,
+} from "@/lib/observability/metrics";
+import { finalizeSearchMetrics } from "@/lib/observability/search-request-telemetry";
+import { extractTraceContext, withSpan } from "@/lib/observability/tracing";
+import { context as otelContext } from "@opentelemetry/api";
 
 const ROUTE = API_ROUTES.searchStream;
 
@@ -38,46 +45,73 @@ export async function POST(request: NextRequest) {
 
     logSearchStart(log, { queryLength: query.length, hasContext: Boolean(context) });
 
+    const parentContext = extractTraceContext(request.headers);
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
-        try {
-          for await (const event of searchTripStream(query, requestId, context)) {
-            controller.enqueue(encodeSse(event));
-          }
+        incrementInflightRequests();
+        await otelContext.with(parentContext, async () =>
+          withSpan("trip.search", async (span) => {
+            span.setAttribute("requestId", requestId);
+            span.setAttribute("route", ROUTE);
 
-          logSearchComplete(log, {
-            durationMs: Date.now() - started,
-            statusCode: 200,
-          });
-        } catch (error) {
-          const status = resolveStreamErrorStatus(error);
-          const durationMs = Date.now() - started;
+            let cacheStatus: string | undefined;
+            try {
+              for await (const event of searchTripStream(query, requestId, context)) {
+                if (event.type === "complete") {
+                  cacheStatus = event.result.meta?.cache?.status;
+                }
+                controller.enqueue(encodeSse(event));
+              }
 
-          logApiError(log, {
-            event:
-              status === 503
-                ? "quorum_failure"
-                : status === 422
-                  ? "parse_error"
-                  : "internal_error",
-            statusCode: status,
-            durationMs,
-            err: status === 500 ? error : undefined,
-            message: error instanceof Error ? error.message : "stream search failed",
-          });
+              logSearchComplete(log, {
+                durationMs: Date.now() - started,
+                statusCode: 200,
+                cacheStatus,
+              });
+              finalizeSearchMetrics({
+                route: ROUTE,
+                statusCode: 200,
+                started,
+                cacheStatus,
+              });
+            } catch (error) {
+              const status = resolveStreamErrorStatus(error);
+              const durationMs = Date.now() - started;
 
-          const message = toUserErrorMessage(error, status);
+              logApiError(log, {
+                event:
+                  status === 503
+                    ? "quorum_failure"
+                    : status === 422
+                      ? "parse_error"
+                      : "internal_error",
+                statusCode: status,
+                durationMs,
+                err: status === 500 ? error : undefined,
+                message: error instanceof Error ? error.message : "stream search failed",
+              });
+              finalizeSearchMetrics({
+                route: ROUTE,
+                statusCode: status,
+                started,
+                cacheStatus,
+              });
 
-          controller.enqueue(
-            encodeSse({
-              type: "error",
-              message,
-              status,
-            }),
-          );
-        } finally {
-          controller.close();
-        }
+              const message = toUserErrorMessage(error, status);
+
+              controller.enqueue(
+                encodeSse({
+                  type: "error",
+                  message,
+                  status,
+                }),
+              );
+            } finally {
+              decrementInflightRequests();
+              controller.close();
+            }
+          }),
+        );
       },
     });
 
@@ -101,6 +135,7 @@ export async function POST(request: NextRequest) {
         err: error,
         message: "invalid request body",
       });
+      finalizeSearchMetrics({ route: ROUTE, statusCode: 400, started });
       return Response.json(
         { error: toUserErrorMessage("Invalid request body", 400) },
         { status: 400 },
@@ -114,6 +149,7 @@ export async function POST(request: NextRequest) {
       err: error,
       message: "trip search stream setup failed",
     });
+    finalizeSearchMetrics({ route: ROUTE, statusCode: 500, started });
     return Response.json({ error: toUserErrorMessage(error, 500) }, { status: 500 });
   }
 }

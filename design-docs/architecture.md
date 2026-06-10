@@ -38,7 +38,7 @@ src/
   lib/providers/       sabre, amadeus, hotelbeds + run-provider-client.ts
   lib/normalization/   per-provider → Unified*Offer
   lib/storage/         redis.ts, trip-query-cache, trip-results
-  lib/observability/   pino logger + API route constants
+  lib/observability/   pino logger, Prometheus metrics, OpenTelemetry tracing
   lib/resilience/      with-timeout, circuit-breaker
   lib/types/           trip.ts — shared types
 
@@ -46,7 +46,7 @@ tests/
   unit/                Vitest — lib, API routes, mocks (mirrors src layout)
   components/          UI unit tests
 
-observability/         Loki, Promtail, Grafana provisioning (Docker Compose)
+observability/         Loki, Promtail, Prometheus, Grafana provisioning (Docker Compose)
 load/                  k6 scripts — SLO and per-pod capacity validation
 ```
 

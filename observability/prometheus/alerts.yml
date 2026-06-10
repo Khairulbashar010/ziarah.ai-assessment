@@ -1,0 +1,66 @@
+groups:
+  - name: trip-search
+    rules:
+      - alert: TripSearchP95LatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(trip_search_duration_ms_bucket[5m])) by (le)) > 3000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Trip search p95 latency above 3s
+          description: p95 search latency has exceeded 3000ms for 5 minutes.
+
+      - alert: TripSearchQuorumFailureRateHigh
+        expr: |
+          (
+            sum(rate(trip_search_total{status_code="503"}[5m]))
+            /
+            clamp_min(sum(rate(trip_search_total[5m])), 0.001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Trip search quorum failure rate above 5%
+          description: More than 5% of searches are returning HTTP 503 due to provider quorum failures.
+
+      - alert: TripSearchCircuitBreakerOpen
+        expr: max by (provider) (circuit_breaker_state) == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Provider circuit breaker open
+          description: Circuit breaker for {{ $labels.provider }} has been open for more than 2 minutes.
+
+      - alert: TripSearchProviderTimeoutsHigh
+        expr: sum by (provider) (rate(provider_timeouts_total[1m])) > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Provider timeout rate high
+          description: Provider {{ $labels.provider }} is timing out more than 10 times per minute.
+
+      - alert: TripSearchCacheHitRatioLow
+        expr: |
+          (
+            sum(rate(cache_operations_total{result="fresh"}[15m]) + rate(cache_operations_total{result="stale"}[15m]))
+            /
+            clamp_min(sum(rate(cache_operations_total[15m])), 0.001)
+          ) < 0.2
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: Trip search cache hit ratio below 20%
+          description: Fresh or stale cache hits are below 20% of cache lookups over 15 minutes.
+
+      - alert: TripSearchRedisDown
+        expr: redis_connection_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Redis connection unhealthy
+          description: Health checks report redis_connection_up=0 for more than 1 minute.

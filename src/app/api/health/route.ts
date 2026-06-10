@@ -1,10 +1,12 @@
 import { NextResponse } from "next/server";
+import { setRedisConnectionUp } from "@/lib/observability/metrics";
 import { getProviderMockStatus } from "@/lib/providers/provider-mode";
 import { pingRedis } from "@/lib/storage/redis";
 
 export async function GET() {
   const providerMocks = getProviderMockStatus();
   const redisOk = await pingRedis();
+  setRedisConnectionUp(redisOk);
 
   return NextResponse.json(
     {

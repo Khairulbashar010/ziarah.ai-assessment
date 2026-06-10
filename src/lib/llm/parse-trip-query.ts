@@ -1,5 +1,7 @@
 import type { TripSearchParams } from "@/lib/types/trip";
 import { rootLogger, logLlmParseFallback } from "@/lib/observability/logger";
+import { recordLlmParse } from "@/lib/observability/metrics";
+import { withSpan } from "@/lib/observability/tracing";
 import { getAirportByCode, resolveAirportCode } from "@/lib/geo/airports";
 import { resolveMetroCity } from "@/lib/geo/metro-cities";
 import { nightsBetween } from "@/lib/utils/dates";
@@ -188,7 +190,12 @@ function tryFastParsePaths(
   query: string,
   context?: TripSearchParams | null,
 ): TripSearchParams | null {
-  return tryContextualParse(query, context) ?? tryFastParse(query);
+  const started = Date.now();
+  const parsed = tryContextualParse(query, context) ?? tryFastParse(query);
+  if (parsed) {
+    recordLlmParse({ source: "regex", durationMs: Date.now() - started });
+  }
+  return parsed;
 }
 
 export async function parseTripQuery(
@@ -251,14 +258,14 @@ export async function* streamParseTripQuery(
       progress: 15,
     };
 
-    const llm = await tryLlmParse(query, context, { mode: "stream" });
+    const llm = await withSpan("llm.parse", async () => tryLlmParse(query, context, { mode: "stream" }));
     if (llm) {
       yield { type: "parsed", params: llm };
       return;
     }
   }
 
-  const fast = tryFastParsePaths(query, context);
+  const fast = await withSpan("llm.parse", async () => tryFastParsePaths(query, context));
   if (fast) {
     yield { type: "parsed", params: fast };
     return;

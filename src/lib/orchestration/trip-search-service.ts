@@ -41,6 +41,8 @@ import {
   requestLogger,
 } from "@/lib/observability/logger";
 import { API_ROUTES } from "@/lib/observability/api-routes";
+import { recordCacheLookup, recordProviderResult, recordQuorumFailure } from "@/lib/observability/metrics";
+import { withSpan } from "@/lib/observability/tracing";
 import type { ProviderFanOutPayload } from "@/lib/llm/provider-payloads";
 
 const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS ?? 2500);
@@ -104,37 +106,52 @@ async function runProvider(
   normalize: (raw: unknown) => UnifiedFlightOffer[] | UnifiedHotelOffer[],
   timeoutMs = PROVIDER_TIMEOUT_MS,
 ): Promise<ProviderRunResult> {
-  const start = Date.now();
+  return withSpan(`provider.${name}`, async () => {
+    const start = Date.now();
 
-  try {
-    const raw = await withTimeout(fn(), timeoutMs, name);
-    const offers = normalize(raw);
+    try {
+      const raw = await withTimeout(fn(), timeoutMs, name);
+      const offers = await withSpan(`normalize.${name}`, async () => normalize(raw));
 
-    return {
-      name,
-      status: {
-        domain,
+      const result: ProviderRunResult = {
+        name,
+        status: {
+          domain,
+          status: "success",
+          offerCount: offers.length,
+          durationMs: Date.now() - start,
+        },
+        flights: domain === "flights" ? (offers as UnifiedFlightOffer[]) : [],
+        hotels: domain === "hotels" ? (offers as UnifiedHotelOffer[]) : [],
+      };
+
+      recordProviderResult({
+        provider: name,
         status: "success",
-        offerCount: offers.length,
-        durationMs: Date.now() - start,
-      },
-      flights: domain === "flights" ? (offers as UnifiedFlightOffer[]) : [],
-      hotels: domain === "hotels" ? (offers as UnifiedHotelOffer[]) : [],
-    };
-  } catch (error) {
-    return {
-      name,
-      status: {
-        domain,
-        status: error instanceof TimeoutError ? "timeout" : "error",
-        offerCount: 0,
-        durationMs: Date.now() - start,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-      flights: [],
-      hotels: [],
-    };
-  }
+        durationMs: result.status.durationMs,
+      });
+
+      return result;
+    } catch (error) {
+      const status = error instanceof TimeoutError ? "timeout" : "error";
+      const durationMs = Date.now() - start;
+
+      recordProviderResult({ provider: name, status, durationMs });
+
+      return {
+        name,
+        status: {
+          domain,
+          status,
+          offerCount: 0,
+          durationMs,
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+        flights: [],
+        hotels: [],
+      };
+    }
+  }, { provider: name, domain });
 }
 
 function countSucceededProviders(results: ProviderRunResult[]): number {
@@ -145,9 +162,11 @@ async function fanOutProviders(
   specs: ProviderJobSpec[],
   timeoutMs = PROVIDER_TIMEOUT_MS,
 ): Promise<ProviderRunResult[]> {
-  return Promise.all(
-    specs.map((spec) =>
-      runProvider(spec.name, spec.domain, spec.fn, spec.normalize, timeoutMs),
+  return withSpan("provider.fanout", async () =>
+    Promise.all(
+      specs.map((spec) =>
+        runProvider(spec.name, spec.domain, spec.fn, spec.normalize, timeoutMs),
+      ),
     ),
   );
 }
@@ -182,7 +201,9 @@ async function maybeRetryFailedProvidersForQuorum(
     retryTimeoutMs: PROVIDER_RETRY_TIMEOUT_MS,
   });
 
-  const retried = await fanOutProviders(retrySpecs, PROVIDER_RETRY_TIMEOUT_MS);
+  const retried = await withSpan("provider.quorum_retry", async () =>
+    fanOutProviders(retrySpecs, PROVIDER_RETRY_TIMEOUT_MS),
+  );
   const byName = new Map(results.map((result) => [result.name, result]));
   for (const result of retried) {
     byName.set(result.name, result);
@@ -263,7 +284,9 @@ export async function searchTrip(
   context?: TripSearchParams | null,
 ): Promise<TripSearchResult> {
   const started = Date.now();
-  const parsedQuery = await parseTripQuery(query, context, { mode: "sync" });
+  const parsedQuery = await withSpan("llm.parse", async () =>
+    parseTripQuery(query, context, { mode: "sync" }),
+  );
   return executeTripSearch(parsedQuery, requestId, started);
 }
 
@@ -281,7 +304,11 @@ async function executeTripSearch(
   requestId: string,
   started: number,
 ): Promise<TripSearchResult> {
-  const lookup = await lookupTripSearchCache(parsedQuery);
+  const lookup = await withSpan("cache.lookup", async () => {
+    const result = await lookupTripSearchCache(parsedQuery);
+    recordCacheLookup(result.status);
+    return result;
+  });
 
   if (lookup.status === "fresh" && lookup.entry) {
     const cached = materializeCachedResult(lookup.entry, requestId, started, "fresh");
@@ -329,7 +356,9 @@ async function finalizeTripSearch(
     requestId,
   );
 
-  return assembleTripResponse(parsedQuery, requestId, started, results);
+  return withSpan("package.response", async () =>
+    assembleTripResponse(parsedQuery, requestId, started, results),
+  );
 }
 
 function pendingProviderStatus(name: ProviderName): ProviderStatus {
@@ -430,15 +459,16 @@ function buildTripSnapshot(
   };
 }
 
-function assembleTripResponse(
+async function assembleTripResponse(
   parsedQuery: TripSearchParams,
   requestId: string,
   started: number,
   results: ProviderRunResult[],
-): TripSearchResult {
+): Promise<TripSearchResult> {
   const succeeded = results.filter((r) => r.status.status === "success").length;
 
   if (succeeded < 2) {
+    recordQuorumFailure();
     const details: QuorumFailureDetails = {
       requestId,
       providersSucceeded: succeeded,
@@ -457,7 +487,9 @@ function assembleTripResponse(
     throw new QuorumError(details);
   }
 
-  return buildTripSnapshot(parsedQuery, requestId, started, results, true);
+  return withSpan("rank.budget", async () =>
+    buildTripSnapshot(parsedQuery, requestId, started, results, true),
+  );
 }
 
 export async function* searchTripStream(
@@ -479,7 +511,11 @@ export async function* searchTripStream(
     throw new Error("Could not parse travel query");
   }
 
-  const cacheLookup = await lookupTripSearchCache(parsedQuery);
+  const cacheLookup = await withSpan("cache.lookup", async () => {
+    const result = await lookupTripSearchCache(parsedQuery);
+    recordCacheLookup(result.status);
+    return result;
+  });
 
   if (cacheLookup.status === "fresh" && cacheLookup.entry) {
     const cached = materializeCachedResult(cacheLookup.entry, requestId, started, "fresh");
@@ -633,7 +669,7 @@ export async function* searchTripStream(
     yield { type: "offers_update", update: toClientOffersUpdate(partial) };
   }
 
-  const result = assembleTripResponse(parsedQuery, requestId, started, quorumResults);
+  const result = await assembleTripResponse(parsedQuery, requestId, started, quorumResults);
   await saveTripSearchCache(parsedQuery, result);
 
   const entry = (await lookupTripSearchCache(parsedQuery)).entry;

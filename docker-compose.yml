@@ -20,6 +20,19 @@ services:
       - loki
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      trip-search:
+        condition: service_healthy
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana:11.6.0
     ports:
@@ -29,12 +42,15 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ALERTING_ENABLED: "true"
+      GF_UNIFIED_ALERTING_ENABLED: "true"
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       - loki
+      - prometheus
     restart: unless-stopped
 
   redis:
@@ -65,6 +81,10 @@ services:
       REDIS_URL: redis://redis:6379
       SERVICE_NAME: ziarah-trip-search
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-console}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       # Mock providers default on; LLM mode comes from .env only (see env_file below).
       MOCK_PROVIDERS: ${MOCK_PROVIDERS:-true}
       MOCK_LATENCY_MS_MIN: ${MOCK_LATENCY_MS_MIN:-200}
@@ -129,3 +149,4 @@ volumes:
   loki-data:
   promtail-positions:
   grafana-data:
+  prometheus-data:

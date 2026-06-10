@@ -59,12 +59,54 @@ docker compose up --build
 | Trip by ID | `GET http://localhost:3000/api/trips/{requestId}` | Cached result lookup |
 | Grafana | [http://localhost:3001](http://localhost:3001) | `admin` / `admin` — override via `GRAFANA_ADMIN_*` in `.env` |
 | Grafana dashboard | [http://localhost:3001/d/trip-search-logs/trip-search-logs](http://localhost:3001/d/trip-search-logs/trip-search-logs) | **Trip Search → Trip Search Logs** — filter by `requestId` |
+| Prometheus | [http://localhost:9090](http://localhost:9090) | Scrapes `GET /api/metrics` every 15s |
+| Metrics | `GET http://localhost:3000/api/metrics` | Prometheus exposition format (`prom-client`) |
 | Loki | [http://localhost:3100](http://localhost:3100) | Log storage (Grafana queries it; Promtail ships app stdout) |
 | Redis | `redis://localhost:6379` | Query cache, result store, refresh locks |
 
-Port overrides: `HOST_PORT`, `GRAFANA_HOST_PORT`, `LOKI_HOST_PORT`, `REDIS_HOST_PORT` in `.env` (see `.env.example`).
+Port overrides: `HOST_PORT`, `GRAFANA_HOST_PORT`, `PROMETHEUS_HOST_PORT`, `LOKI_HOST_PORT`, `REDIS_HOST_PORT` in `.env` (see `.env.example`).
 
-**Debugging a request:** copy `X-Request-Id` from an API response header → paste it into the Grafana dashboard variable to see all logs for that search.
+**Debugging a request:**
+
+1. Copy `X-Request-Id` from an API response header → paste it into the Grafana **Trip Search Logs** dashboard to see structured logs.
+2. Check `GET /api/metrics` or Prometheus (`:9090`) for `trip_search_duration_ms`, `provider_duration_ms`, and `quorum_failures_total`.
+3. OpenTelemetry spans (when `OTEL_ENABLED=true`) print to stdout in Docker Compose (`OTEL_TRACES_EXPORTER=console` by default).
+
+### Observability (Docker Compose)
+
+After `docker compose up --build`, run a few searches so metrics have data to scrape.
+
+**Logs — Grafana**
+
+1. Open [http://localhost:3001](http://localhost:3001) (`admin` / `admin` by default).
+2. Go to **Dashboards → Trip Search → Trip Search Logs**.
+3. Paste a `requestId` from `X-Request-Id` into the dashboard variable to filter events (`search_start` → `provider_result` → `search_complete`).
+
+**Metrics — Prometheus**
+
+1. Open [http://localhost:9090](http://localhost:9090).
+2. **Graph** — try `trip_search_duration_ms_bucket`, `provider_duration_ms_bucket`, or `rate(quorum_failures_total[5m])`.
+3. **Alerts** — provisioned rules include p95 > 3s, quorum failure rate > 5%, circuit breaker open, provider timeouts, cache hit ratio, and Redis down (`observability/prometheus/alerts.yml`).
+
+Raw exposition format is also at `GET http://localhost:3000/api/metrics`.
+
+**Traces — app stdout**
+
+Spans print to the `trip-search` container logs when `OTEL_ENABLED=true` (default in Compose). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to ship spans to Tempo/Jaeger instead of stdout.
+
+```bash
+docker compose logs -f trip-search
+```
+
+**Alerts — Grafana**
+
+1. In Grafana, open **Alerting → Alert rules**.
+2. Filter by folder **Trip Search** — rules are auto-provisioned from `observability/grafana/provisioning/alerting/rules.yml`:
+   - Trip search p95 > 3s
+   - Quorum failure rate > 5%
+   - Redis connection down
+
+Notification channels (Slack, PagerDuty, etc.) are not wired in this repo — add a contact point in Grafana to receive fires. Full metric and alert reference: [observability.md](design-docs/observability.md).
 
 ### Local development
 
@@ -94,7 +136,7 @@ Copy `.env.example` → `.env` and adjust mock flags (see [Mock and live configu
 | Health | [http://localhost:3000/api/health](http://localhost:3000/api/health) |
 | Redis | `redis://localhost:6379` |
 
-Grafana and Loki are not started in local-only mode — use Docker Compose for the log stack.
+Grafana, Loki, and Prometheus are not started in local-only mode — use Docker Compose for the full observability stack. Metrics and tracing still work locally (`GET /api/metrics`; spans to stdout when `OTEL_ENABLED=true`).
 
 ### Verify it works
 
@@ -120,7 +162,7 @@ Two layers: **Vitest** for unit and integration tests (~100 files under `tests/`
 
 ### Unit and integration tests (Vitest)
 
-Runs with mocked providers and a mocked Redis client (`tests/unit/setup.ts`) — no live GDS, HotelBeds, or OpenAI calls.
+Runs with mocked providers and a mocked Redis client (`tests/unit/setup.ts`) — no live GDS, HotelBeds, or OpenAI calls. Metrics and tracing are disabled in the default test setup (`METRICS_ENABLED=false`, `OTEL_ENABLED=false`); observability has dedicated tests that opt in.
 
 ```bash
 npm test                  # run once (CI)
@@ -138,7 +180,8 @@ npx vitest run tests/unit/app/api/trips/search/route.test.ts
 | Area | Location | What it covers |
 |------|----------|----------------|
 | **Orchestration** | `tests/unit/lib/orchestration/` | Trip search pipeline, quorum, cache, SSE stream, budget filter, provider errors |
-| **API routes** | `tests/unit/app/api/` | `GET /api/health`, `POST /api/trips/search`, `POST /api/trips/search/stream`, `GET /api/trips/{id}` |
+| **API routes** | `tests/unit/app/api/` | `GET /api/health`, `GET /api/metrics`, `POST /api/trips/search`, `POST /api/trips/search/stream`, `GET /api/trips/{id}` |
+| **Observability** | `tests/unit/lib/observability/` | Prometheus metrics, OpenTelemetry tracing, structured logging |
 | **Normalization** | `tests/unit/lib/normalization/` | Sabre, Amadeus, HotelBeds payload → unified offer shapes |
 | **Providers** | `tests/unit/lib/providers/` | Client/auth, mock mode, live adapter request builders |
 | **LLM parsing** | `tests/unit/lib/llm/` | Regex + OpenAI parsers, schemas, chat intent, trip modifications |
@@ -218,6 +261,17 @@ Per-provider vars override the master switch. Unset = follow `MOCK_PROVIDERS`.
 
 Without a key, parsing always falls back to regex regardless of `MOCK_LLM`.
 
+#### Metrics and tracing
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `METRICS_ENABLED` | `true` | `false` disables `GET /api/metrics` and in-process Prometheus recording |
+| `OTEL_ENABLED` | `true` | `false` disables OpenTelemetry spans |
+| `OTEL_TRACES_EXPORTER` | `console` in Compose | Where spans go (`console` = stdout) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | Set to export spans to Tempo/Jaeger (e.g. `http://tempo:4318`) |
+
+Vitest sets `METRICS_ENABLED=false` and `OTEL_ENABLED=false` in `tests/unit/setup.ts` to keep unit tests isolated.
+
 #### Common setups
 
 **All mock (Docker demo, no keys needed):**
@@ -283,6 +337,8 @@ Deterministic failure triggers (origin `ZZZ`, `destinationCode` `FAIL`, etc.) ar
 
 **Trip-level budget.** Users say "$3000 for the trip," not "$1500 flights, $1500 hotels." Filtering happens after ranking across both verticals. Per-vertical caps from one number aren't supported in v1.
 
+**Observability in three signals.** Structured logs (pino → Loki) for request debugging, Prometheus metrics on `/api/metrics` for SLOs and alerting, OpenTelemetry spans for latency breakdown. Trade-off: more moving parts in Docker Compose (Promtail, Loki, Prometheus, Grafana) vs. running logs-only locally.
+
 ---
 
 ## Future improvements
@@ -297,8 +353,8 @@ Ordered by priority if this were going to production.
 
 **2. Observability before scale**
 
-- OpenTelemetry: root span `trip.search`, children for `llm.parse`, each `provider.*`, `normalize`, `rank` — correlate on `requestId`
-- Prometheus: `trip_search_duration_ms`, `provider_duration_ms`, quorum failure rate, breaker state, cache hit ratio
+- OTLP export to Tempo/Jaeger in production (local Compose uses console exporter by default)
+- Grafana metrics dashboard and alert notification channels (Slack/PagerDuty)
 - Load test to validate 10k concurrent / 3s p95 — math in [kubernetes.md](design-docs/kubernetes.md); evidence still needed
 
 **3. Resilience gaps**
@@ -329,5 +385,5 @@ Ordered by priority if this were going to production.
 | Module layout, cache layers | [architecture.md](design-docs/architecture.md) |
 | Request/response types, SSE events | [api-contract.md](design-docs/api-contract.md) |
 | Timeouts, quorum, breakers | [resilience.md](design-docs/resilience.md) |
-| Logs today, metrics/traces roadmap | [observability.md](design-docs/observability.md) |
+| Logs, metrics, traces, alerts | [observability.md](design-docs/observability.md) |
 | K8s manifests, HPA, Redis | [kubernetes.md](design-docs/kubernetes.md) |

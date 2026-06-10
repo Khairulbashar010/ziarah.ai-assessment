@@ -3,4 +3,5 @@ export const API_ROUTES = {
   searchStream: "/api/trips/search/stream",
   tripById: "/api/trips/[id]",
   health: "/api/health",
+  metrics: "/api/metrics",
 } as const;

@@ -163,7 +163,7 @@ One Next.js deployable with module boundaries under `src/lib/`. The bottleneck i
 | Providers | `src/lib/providers/` | Auth, live/mock clients, breaker wrapper |
 | Normalization | `src/lib/normalization/` | Provider JSON → unified offer types |
 | Storage | `src/lib/storage/` | Redis client, query cache, result store, refresh locks |
-| Observability | `src/lib/observability/` | pino structured logging (metrics/traces: planned — see [observability.md](./observability.md)) |
+| Observability | `src/lib/observability/` | pino logs, Prometheus metrics, OpenTelemetry traces — see [observability.md](./observability.md) |
 | Resilience | `src/lib/resilience/` | `withTimeout`, `CircuitBreaker` |
 
 **Future extraction boundaries** (defined, not built): provider gateway for multi-GDS credential and rate-limit management; LLM service for self-hosted models; booking service for ticketing/PCI. Search runs as one image, one deployment, one health check today.
@@ -271,14 +271,11 @@ Mock mode supports chaos testing: origin `ZZZ` (or city `fail`) kills flight pro
 
 - **Structured logging (pino)** — JSON to stdout, keyed on `requestId` + `route`. Events: search lifecycle, provider results, quorum retry, quorum failures, LLM parse/fallback, Redis errors.
 - **Log aggregation (Docker Compose)** — Promtail → Loki → Grafana with a Trip Search Logs dashboard. Filter by `requestId`.
+- **Metrics** — `GET /api/metrics` (Prometheus): `trip_search_duration_ms`, `provider_duration_ms`, `llm_parse_duration_ms`, quorum failures, breaker state, cache hits, `http_inflight_requests`, `redis_connection_up`.
+- **Tracing** — OpenTelemetry span tree rooted at `trip.search` with children for `llm.parse`, `cache.lookup`, `provider.*`, `normalize.*`, `provider.quorum_retry`, `rank.budget`. W3C `traceparent` at ingress.
+- **Alerts** — Prometheus rules + Grafana unified alerting: p95 > 3s, 503 rate > 5%, breaker open > 2 min, provider timeouts, cache hit ratio, Redis down.
 - **Health** — `GET /api/health` includes Redis ping; returns 503 when Redis is down.
 - **Correlation** — `X-Request-Id` and `X-Duration-Ms` on SSE responses.
-
-### Planned for production
-
-- **Metrics** — Prometheus scrape on `/api/metrics`: search duration, per-provider latency, quorum failures, breaker state, cache hit ratio.
-- **Tracing** — OpenTelemetry span tree rooted at `trip.search`.
-- **Alerts** — p95 > 3s for 5 min, 503 rate > 5%, circuit breaker open > 2 min, Redis unreachable > 1 min.
 
 **Load validation:** k6 scripts in `load/` — smoke, sync SLO (p95 < 3s), stream, and step-ramp capacity. See [load/README.md](../load/README.md).
 
