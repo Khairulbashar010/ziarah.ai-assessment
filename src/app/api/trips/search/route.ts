@@ -5,6 +5,7 @@ import { tripSearchRequestSchema } from "@/lib/api/trip-search-request";
 import { searchTrip, QuorumError } from "@/lib/orchestration/trip-search-service";
 import { toClientTripResponse } from "@/lib/trip-search/client-payload";
 import { withTimeout } from "@/lib/resilience/with-timeout";
+import { toUserErrorMessage } from "@/lib/user-messages";
 
 const GLOBAL_TIMEOUT_MS = Number(process.env.GLOBAL_TIMEOUT_MS ?? 60_000);
 
@@ -25,27 +26,36 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof z.ZodError) {
       return NextResponse.json(
-        { error: "Invalid request body", details: error.flatten() },
+        { error: toUserErrorMessage("Invalid request body", 400) },
         { status: 400 },
       );
     }
 
     if (error instanceof QuorumError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+      return NextResponse.json(
+        { error: toUserErrorMessage(error.message, 503) },
+        { status: 503 },
+      );
     }
 
     if (error instanceof Error && error.message.includes("parse")) {
-      return NextResponse.json({ error: "Could not parse travel query" }, { status: 422 });
+      return NextResponse.json(
+        { error: toUserErrorMessage(error.message, 422) },
+        { status: 422 },
+      );
     }
 
     if (error instanceof Error && error.message.includes("Global timed out")) {
       return NextResponse.json(
-        { error: "Request timed out", durationMs: Date.now() - started },
+        { error: toUserErrorMessage(error.message, 504) },
         { status: 504 },
       );
     }
 
     console.error("Trip search error:", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return NextResponse.json(
+      { error: toUserErrorMessage(error, 500) },
+      { status: 500 },
+    );
   }
 }

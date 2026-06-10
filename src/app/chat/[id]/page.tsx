@@ -20,6 +20,12 @@ import { buildTripSearchShell } from "@/lib/client/trip-search-shell";
 import type { TripSearchParams, TripSearchResponse } from "@/lib/types/trip";
 import { formatDateRange } from "@/lib/utils/dates";
 import { totalPassengers } from "@/lib/utils/trip";
+import { useToast } from "@/components/ui/toast";
+import {
+  toUserErrorMessage,
+  toUserStatusMessage,
+  USER_ERRORS,
+} from "@/lib/user-messages";
 
 import type { ProcessingStep } from "@/components/chat/processing-steps";
 
@@ -66,7 +72,7 @@ function ChatPageContent() {
   const [loadingProgress, setLoadingProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState("Starting your trip search...");
   const [processingSteps, setProcessingSteps] = useState<ProcessingStep[]>(INITIAL_PROCESSING_STEPS);
-  const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
   const tripContextRef = useRef<TripSearchParams | null>(null);
 
   const runSearch = useCallback(
@@ -77,7 +83,6 @@ function ChatPageContent() {
         context ? "Updating your trip details..." : "Starting your trip search...",
       );
       setProcessingSteps(INITIAL_PROCESSING_STEPS);
-      setError(null);
 
       try {
         await searchTripClientStream(
@@ -86,7 +91,8 @@ function ChatPageContent() {
             requestId,
             onEvent: (event) => {
               if (event.type === "status") {
-                setStatusMessage(event.message);
+                const friendlyStatus = toUserStatusMessage(event.message);
+                setStatusMessage(friendlyStatus);
                 if (event.progress !== undefined) setLoadingProgress(event.progress);
 
                 if (event.message.toLowerCase().includes("understanding")) {
@@ -115,7 +121,7 @@ function ChatPageContent() {
                 setResult(buildTripSearchShell(requestId, event.params));
                 setLoadingProgress((prev) => Math.max(prev, 30));
                 setProcessingSteps((steps) => advanceProcessingSteps(steps, "flights"));
-                setStatusMessage("Searching flight inventory...");
+                setStatusMessage("Searching for flights...");
                 setMessages((prev) => {
                   const next = [...prev];
                   const last = next[next.length - 1];
@@ -139,8 +145,8 @@ function ChatPageContent() {
                 }
                 setStatusMessage(
                   event.status.domain === "flights"
-                    ? "Flight options matched to your trip"
-                    : "Hotel stays matched to your trip",
+                    ? "Found flights that match your trip"
+                    : "Found hotels that match your trip",
                 );
               }
 
@@ -181,11 +187,24 @@ function ChatPageContent() {
           context,
         );
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Search failed");
+        const friendlyError = toUserErrorMessage(err);
+        toast.error(friendlyError);
         setPhase("results");
+        setMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last?.role === "assistant") {
+            next[next.length - 1] = {
+              ...last,
+              content:
+                "I ran into a problem finishing that search. Try rephrasing your trip or search again in a moment.",
+            };
+          }
+          return next;
+        });
       }
     },
-    [requestId],
+    [requestId, toast],
   );
 
   useEffect(() => {
@@ -232,12 +251,12 @@ function ChatPageContent() {
         ]);
         setPhase("results");
       } else {
-        setError("Trip not found. Start a new search from the home page.");
+        toast.error(USER_ERRORS.notFound);
       }
     }
 
     load();
-  }, [requestId, queryParam, shouldSearch, runSearch]);
+  }, [requestId, queryParam, shouldSearch, runSearch, toast]);
 
   const handleSendMessage = useCallback(
     async (message: string) => {
@@ -286,22 +305,16 @@ function ChatPageContent() {
       <TripTopBar dates={dates} travellers={travellers} />
       <div className="flex flex-1 overflow-hidden">
         <div className="w-[38%] min-w-[300px] max-w-[480px] border-r border-gray-100">
-          {error ? (
-            <div className="flex h-full items-center justify-center p-6 text-sm text-red-500">
-              {error}
-            </div>
-          ) : (
-            <ChatPanel
-              messages={messages}
-              result={result}
-              parsedParams={parsedParams}
-              loading={phase === "loading"}
-              loadingProgress={loadingProgress}
-              statusMessage={statusMessage}
-              processingSteps={processingSteps}
-              onSendMessage={handleSendMessage}
-            />
-          )}
+          <ChatPanel
+            messages={messages}
+            result={result}
+            parsedParams={parsedParams}
+            loading={phase === "loading"}
+            loadingProgress={loadingProgress}
+            statusMessage={statusMessage}
+            processingSteps={processingSteps}
+            onSendMessage={handleSendMessage}
+          />
         </div>
 
         <div className="flex-1 overflow-hidden">

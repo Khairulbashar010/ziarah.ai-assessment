@@ -19,6 +19,7 @@ type TripFooterProps = {
   hotelPrice?: number;
   flightLabel?: string;
   hotelLabel?: string;
+  selectionSummary?: string;
   hotelBreakdown?: BreakdownItem[];
   onBook?: () => void;
 };
@@ -61,6 +62,7 @@ export function TripFooter({
   hotelPrice,
   flightLabel,
   hotelLabel,
+  selectionSummary,
   hotelBreakdown,
   onBook,
 }: TripFooterProps) {
@@ -79,6 +81,8 @@ export function TripFooter({
   const remaining =
     budget !== undefined && total !== null ? roundMoney(budget - total) : null;
 
+  const canBook = total !== null && withinBudget !== false;
+
   return (
     <div className="relative overflow-hidden rounded-2xl border border-gray-100 bg-white shadow-lg">
       {expanded && budgetUsed !== null && (
@@ -93,19 +97,9 @@ export function TripFooter({
         </div>
       )}
 
-      <button
-        type="button"
-        onClick={() => setExpanded((open) => !open)}
-        aria-label={expanded ? "Collapse trip total" : "Expand trip total"}
-        aria-expanded={expanded}
-        className="absolute right-3 top-3 z-10 flex h-7 w-7 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
-      >
-        {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-      </button>
-
       {expanded ? (
-        <div className="flex flex-col gap-4 px-5 pb-4 pt-3 pr-12 sm:flex-row sm:items-center sm:gap-6">
-          <div className="shrink-0">
+        <div className="flex flex-col gap-4 px-5 pb-4 pt-3 sm:flex-row sm:items-center sm:gap-6">
+          <div className="shrink-0 pr-10 sm:pr-0">
             <p className="text-[11px] font-medium uppercase tracking-wider text-gray-400">Trip total</p>
             <div className="mt-0.5 flex items-baseline gap-1.5 whitespace-nowrap">
               <span className="text-2xl font-bold tracking-tight text-gray-900 sm:text-3xl">
@@ -150,28 +144,62 @@ export function TripFooter({
             </div>
           )}
 
-          <button
-            type="button"
-            onClick={onBook}
-            disabled={withinBudget === false || total === null}
-            className="shrink-0 self-start rounded-xl bg-accent px-6 py-3 text-sm font-semibold text-white shadow-md shadow-purple-200 transition-all hover:opacity-90 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none sm:self-center sm:px-8 sm:py-3.5"
-          >
-            Book Now
-          </button>
+          <div className="flex shrink-0 items-center gap-2 self-start sm:self-center">
+            <button
+              type="button"
+              onClick={onBook}
+              disabled={!canBook}
+              className="rounded-xl bg-accent px-6 py-3 text-sm font-semibold text-white shadow-md shadow-purple-200 transition-all hover:opacity-90 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none sm:px-8 sm:py-3.5"
+            >
+              Book Now
+            </button>
+            <button
+              type="button"
+              onClick={() => setExpanded(false)}
+              aria-label="Collapse trip total"
+              className="flex h-10 w-10 items-center justify-center rounded-xl border border-gray-200 text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600"
+            >
+              <ChevronDown className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       ) : (
-        <button
-          type="button"
-          onClick={() => setExpanded(true)}
-          className="flex w-full items-center px-5 py-3 pr-12 text-left transition-colors hover:bg-gray-50/60"
-        >
-          <div className="flex items-baseline gap-1.5 whitespace-nowrap">
-            <span className="text-xl font-bold tracking-tight text-gray-900">
-              {total !== null ? `$${formatPrice(total)}` : "—"}
-            </span>
-            <span className="text-sm text-gray-400">{currency}</span>
+        <div className="flex items-center gap-3 px-4 py-3 sm:px-5">
+          <div className="shrink-0">
+            <div className="flex items-baseline gap-1.5 whitespace-nowrap">
+              <span className="text-xl font-bold tracking-tight text-gray-900">
+                {total !== null ? `$${formatPrice(total)}` : "—"}
+              </span>
+              <span className="text-sm text-gray-400">{currency}</span>
+            </div>
           </div>
-        </button>
+
+          {selectionSummary ? (
+            <p className="min-w-0 flex-1 truncate text-sm text-gray-500">{selectionSummary}</p>
+          ) : (
+            <p className="min-w-0 flex-1 truncate text-sm text-gray-400">Pick a flight and hotel</p>
+          )}
+
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={onBook}
+              disabled={!canBook}
+              className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-purple-200 transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none sm:px-6 sm:py-3"
+            >
+              Book Now
+            </button>
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              aria-label="Expand trip breakdown"
+              aria-expanded={false}
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-gray-200 text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600"
+            >
+              <ChevronUp className="h-4 w-4 rotate-180" />
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

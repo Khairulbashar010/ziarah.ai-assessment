@@ -36,6 +36,11 @@ export function runProviderClient<TParams>(
     if (shouldMockProvider(provider)) {
       await mockLatency();
 
+      const failureRate = Number(process.env.MOCK_FAILURE_RATE ?? 0);
+      if (failureRate > 0 && Math.random() < failureRate) {
+        throw new Error(options.failMessage ?? `${name} unavailable`);
+      }
+
       if (options.shouldFail?.(params)) {
         throw new Error(options.failMessage ?? `${name} unavailable`);
       }

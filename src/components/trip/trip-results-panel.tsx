@@ -126,6 +126,13 @@ export function TripResultsPanel({ result, searching = false }: TripResultsPanel
     return `${hotelStays.length} hotel stays`;
   }, [hotelStays, hotels]);
 
+  const selectionSummary = useMemo(() => {
+    if (!selectedFlight || hotelStays.length === 0) return undefined;
+    const flightPart = `${selectedFlight.validatingCarrier} flight`;
+    const hotelPart = hotelSummaryLabel ?? "Hotel";
+    return `${flightPart} · ${hotelPart}`;
+  }, [selectedFlight, hotelStays.length, hotelSummaryLabel]);
+
   const handleSelectFlight = useCallback(
     (flightId: string) => {
       const flight = flights.find((offer) => offer.id === flightId);
@@ -296,6 +303,7 @@ export function TripResultsPanel({ result, searching = false }: TripResultsPanel
               : undefined
           }
           hotelLabel={hotelSummaryLabel}
+          selectionSummary={selectionSummary}
           hotelBreakdown={hotelBreakdown.length > 1 ? hotelBreakdown : undefined}
         />
       </div>

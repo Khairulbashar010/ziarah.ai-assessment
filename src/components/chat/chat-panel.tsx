@@ -8,6 +8,7 @@ import type { ChatMessage } from "@/lib/chat/messages";
 import type { TripSearchParams, TripSearchResponse } from "@/lib/types/trip";
 import { formatDateLong, nightsBetween } from "@/lib/utils/dates";
 import { cn } from "@/lib/utils/cn";
+import { toUserStatusMessage } from "@/lib/user-messages";
 import type { ProcessingStep } from "@/components/chat/processing-steps";
 
 export type { ProcessingStep };
@@ -104,8 +105,9 @@ function AssistantMessage({
             <p className="text-sm font-medium text-gray-900">Planning your trip...</p>
             <ProcessingStepsList steps={processingSteps} />
             <p className="text-xs text-gray-500">
-              {statusMessage ?? "Searching our flight and hotel inventory..."}
-              {loadingProgress && loadingProgress > 0 ? ` · ${loadingProgress}%` : ""}
+              {toUserStatusMessage(
+                statusMessage ?? "Searching flights and hotels...",
+              )}
             </p>
           </div>
         )}

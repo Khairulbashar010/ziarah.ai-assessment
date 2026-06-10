@@ -1,6 +1,17 @@
 # Ziarah Trip Search Service
 
-Engineering assessment submission for [Ziarah.ai](https://ziarah.ai) — a conversational trip search service that aggregates **Sabre** and **Amadeus** flights with **HotelBeds** hotels from a single natural-language query.
+Engineering Lead assessment submission for [Ziarah.ai](https://ziarah.ai) — a conversational trip search service that aggregates **Sabre** and **Amadeus** flights with **HotelBeds** hotels from a single natural-language query.
+
+## Assessment deliverables
+
+| Deliverable | Location |
+|-------------|----------|
+| Design document (architecture, API, resilience, K8s) | [`docs/DESIGN.md`](docs/DESIGN.md) |
+| Working orchestration service (Next.js + TypeScript) | `src/lib/orchestration/`, `src/app/api/trips/` |
+| Mock provider clients (latency + failures) | `src/mocks/`, `src/lib/providers/` |
+| LLM parsing (OpenAI or deterministic mock) | `src/lib/llm/` |
+| Tests (28 files, 85+ cases) | `npm test` |
+| Docker | `Dockerfile`, `docker-compose.yml` |
 
 ## Airport data
 
@@ -98,6 +109,14 @@ src/
 
 See [`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md) for enterprise OTA comparison and refactor roadmap.
 
+## Demo scenarios
+
+| Query | Expected behavior |
+|-------|-------------------|
+| `family of 4 from Dubai to London, December 20-27, budget $3000` | All 3 providers succeed, unified flights + hotels |
+| `family of 4 from fail to London, December 20-27` | Quorum fails (origin `ZZZ`), HTTP 503 |
+| Set `MOCK_FAILURE_RATE=0.3` | ~30% random provider failures; quorum still met when ≥2 succeed |
+
 ## Trade-offs
 
 | Decision | Rationale |
@@ -105,6 +124,7 @@ See [`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md) for enterprise 
 | Modular monolith (Next.js) | Sufficient for 10k concurrent users via horizontal pod scaling |
 | HotelBeds for hotels, not flights | Matches Ziarah's product and real provider capabilities |
 | `MOCK_LLM=true` by default | Deterministic CI/Docker without OpenAI key; set `MOCK_LLM=false` + `OPENAI_API_KEY` for free-form NL |
+| No provider retries | Retries blow the 3s p95 budget; circuit breaker + quorum instead |
 | In-memory trip cache | Demo simplicity; production would use Redis |
 
 ## With more time

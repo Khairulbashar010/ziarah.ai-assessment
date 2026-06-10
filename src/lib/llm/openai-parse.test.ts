@@ -87,7 +87,7 @@ describe("OpenAI trip parser", () => {
     expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("maxTotal");
     expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("flights.returnDate");
     expect(TRIP_PARSE_SYSTEM_PROMPT).toContain('"by $N"');
-    expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("3k");
+    expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("k/K=×1000");
     expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("omit entirely unless");
     expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("non-stop");
     expect(TRIP_PARSE_SYSTEM_PROMPT).toContain("minStars");

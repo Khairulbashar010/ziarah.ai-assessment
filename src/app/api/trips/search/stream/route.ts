@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from "uuid";
 import { tripSearchRequestSchema } from "@/lib/api/trip-search-request";
 import { searchTripStream, QuorumError } from "@/lib/orchestration/trip-search-service";
 import type { TripSearchStreamEvent } from "@/lib/trip-search/stream-events";
+import { toUserErrorMessage } from "@/lib/user-messages";
 
 function encodeSse(event: TripSearchStreamEvent): Uint8Array {
   return new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`);
@@ -24,21 +25,14 @@ export async function POST(request: NextRequest) {
             controller.enqueue(encodeSse(event));
           }
         } catch (error) {
-          const message =
-            error instanceof QuorumError
-              ? error.message
-              : error instanceof Error && error.message.includes("parse")
-                ? "Could not parse travel query"
-                : error instanceof Error
-                  ? error.message
-                  : "Internal server error";
-
           const status =
             error instanceof QuorumError
               ? 503
               : error instanceof Error && error.message.includes("parse")
                 ? 422
                 : 500;
+
+          const message = toUserErrorMessage(error, status);
 
           controller.enqueue(
             encodeSse({
@@ -65,12 +59,12 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof z.ZodError) {
       return Response.json(
-        { error: "Invalid request body", details: error.flatten() },
+        { error: toUserErrorMessage("Invalid request body", 400) },
         { status: 400 },
       );
     }
 
     console.error("Trip search stream error:", error);
-    return Response.json({ error: "Internal server error" }, { status: 500 });
+    return Response.json({ error: toUserErrorMessage(error, 500) }, { status: 500 });
   }
 }

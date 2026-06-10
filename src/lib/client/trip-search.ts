@@ -1,5 +1,6 @@
 import type { TripSearchParams, TripSearchResponse } from "@/lib/types/trip";
 import type { TripSearchStreamEvent } from "@/lib/trip-search/stream-events";
+import { toUserErrorMessage } from "@/lib/user-messages";
 
 const STORAGE_KEY = "ziarah-trip-results";
 
@@ -44,7 +45,7 @@ export async function searchTripClient(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.error ?? `Search failed (${response.status})`);
+    throw new Error(toUserErrorMessage(error.error, response.status));
   }
 
   const result = (await response.json()) as TripSearchResponse;
@@ -74,11 +75,11 @@ export async function searchTripClientStream(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.error ?? `Search failed (${response.status})`);
+    throw new Error(toUserErrorMessage(error.error, response.status));
   }
 
   if (!response.body) {
-    throw new Error("Streaming response unavailable");
+    throw new Error(toUserErrorMessage("Streaming response unavailable"));
   }
 
   const reader = response.body.getReader();
@@ -112,7 +113,7 @@ export async function searchTripClientStream(
       }
 
       if (event.type === "error") {
-        throw new Error(event.message);
+        throw new Error(toUserErrorMessage(event.message, event.status));
       }
     }
   }
