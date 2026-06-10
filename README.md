@@ -112,26 +112,73 @@ curl -X POST http://localhost:3000/api/trips/search \
 
 **Stream API** (what the chat UI uses): `POST /api/trips/search/stream` — SSE events as each provider completes. See [api-contract.md](design-docs/api-contract.md).
 
-**Tests:**
+---
+
+## Testing
+
+Two layers: **Vitest** for unit and integration tests (~100 files under `tests/`), and **[k6](https://k6.io/)** for smoke and load tests against a running app.
+
+### Unit and integration tests (Vitest)
+
+Runs with mocked providers and a mocked Redis client (`tests/unit/setup.ts`) — no live GDS, HotelBeds, or OpenAI calls.
 
 ```bash
-npm test
+npm test                  # run once (CI)
+npm run test:watch        # re-run on file changes
+npx vitest run --coverage # coverage report (80% thresholds in vitest.config.ts)
 ```
 
-**Load tests** ([k6](https://k6.io/) — install locally, or use Docker against the Compose stack):
+Run a subset by path:
 
 ```bash
-npm run loadtest:smoke        # quick sanity check
-npm run loadtest:sync         # p95 vs 3s SLO, ramp to 50 VUs
-npm run loadtest:capacity     # step-ramp to ~100 VUs
+npx vitest run tests/unit/lib/orchestration
+npx vitest run tests/unit/app/api/trips/search/route.test.ts
+```
 
-# Docker — docker compose up first
+| Area | Location | What it covers |
+|------|----------|----------------|
+| **Orchestration** | `tests/unit/lib/orchestration/` | Trip search pipeline, quorum, cache, SSE stream, budget filter, provider errors |
+| **API routes** | `tests/unit/app/api/` | `GET /api/health`, `POST /api/trips/search`, `POST /api/trips/search/stream`, `GET /api/trips/{id}` |
+| **Normalization** | `tests/unit/lib/normalization/` | Sabre, Amadeus, HotelBeds payload → unified offer shapes |
+| **Providers** | `tests/unit/lib/providers/` | Client/auth, mock mode, live adapter request builders |
+| **LLM parsing** | `tests/unit/lib/llm/` | Regex + OpenAI parsers, schemas, chat intent, trip modifications |
+| **Resilience** | `tests/unit/lib/resilience/` | Timeouts, circuit breaker |
+| **Storage & cache** | `tests/unit/lib/storage/` | Redis helpers, query cache, result store |
+| **Client & UI logic** | `tests/unit/lib/client/`, `tests/components/` | Trip search client, filters, budget, hotels; React components (Testing Library) |
+| **Pages** | `tests/app/` | Landing, chat workspace, layout render smoke tests |
+| **Mocks** | `tests/unit/mocks/` | Seed data, MSW-style handlers, artificial latency |
+
+Provider mocks mirror real Sabre/Amadeus/HotelBeds response shapes so normalization and orchestration tests catch field-mapping regressions without sandbox quota.
+
+### Smoke and load tests (k6)
+
+These hit a **running** app (`npm run dev`, `npm run start`, or `docker compose up`). Default target is `http://localhost:3000`. Use mock mode (`MOCK_PROVIDERS=true`, `MOCK_LLM=true`) so results reflect app + Redis overhead, not real GDS latency.
+
+Install [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) locally, or use the Docker scripts against the Compose stack.
+
+| Script | Command | Purpose |
+|--------|---------|---------|
+| **Smoke** | `npm run loadtest:smoke` | 2 VUs, 15s — `GET /api/health` + `POST /api/trips/search`; CI / post-deploy gate |
+| **Sync SLO** | `npm run loadtest:sync` | Ramp to 50 VUs, hold 2m — p95 vs **3s** SLO on sync search |
+| **Stream** | `npm run loadtest:stream` | SSE path (`POST /api/trips/search/stream`), ramp to 30 VUs — chat UI route |
+| **Capacity** | `npm run loadtest:capacity` | Step-ramp to ~100 VUs — find per-pod in-flight ceiling |
+
+Override the target host:
+
+```bash
+BASE_URL=http://127.0.0.1:3001 npm run loadtest:smoke
+```
+
+**Docker** (stack must be up — `docker compose up`):
+
+```bash
 npm run loadtest:docker:smoke
 npm run loadtest:docker:sync
+npm run loadtest:docker:stream
 npm run loadtest:docker:capacity
 ```
 
-See [load/README.md](load/README.md) for tuning and K8s-scale runs.
+Tuning (`K6_TARGET_VUS`, `K6_HOLD_DURATION`, `P95_SLO_MS`, etc.), scenario details, and K8s-scale runs: [load/README.md](load/README.md).
 
 ### Mock and live configuration
 
